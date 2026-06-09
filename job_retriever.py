@@ -6,7 +6,7 @@
 
 流程：
     1. LLM 根据用户画像生成 3 个不同侧重的检索 Query（技能 / 项目 / 求职意向），失败时规则兜底；
-    2. 对每个 Query 取 embedding，在本地 ChromaDB（./job_db, collection=jobs）做向量检索；
+    2. 对每个 Query 取 embedding，在本地 ChromaDB（data/chroma_db, collection=jobs）做向量检索；
     3. 支持 city / direction / education 元数据过滤，过滤后为空时逐级降级重试；
     4. 合并三组结果，按 job_id 去重（保留最高分、合并 matched_terms）；
     5. 按 retrieval_score 降序返回 Top-K。

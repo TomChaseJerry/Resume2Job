@@ -30,10 +30,10 @@ _COMMUTE_TOP_K = 10
 # ===== 早节点：通勤意图抽取 + 规划检索 =====
 def commute_planner_node(state: AgentState) -> AgentState:
     """抽取通勤意图并回填检索参数。need_commute 为 False 时早返回。"""
-    print("[commute_planner_node] 开始执行...")
-
+    # 通勤未开启：静默跳过，不打印「开始执行」，避免日志误导（看似执行实则未做事）
     if not get_plan_flag(state, "need_commute"):
         return state
+    print("[commute_planner_node] 开始执行...")
 
     user_query = state.get("user_query") or ""
     intent = extract_commute_intent(user_query)
@@ -87,18 +87,31 @@ def _build_commute_jobs(match_results: list) -> list:
 
 def commute_node(state: AgentState) -> AgentState:
     """计算通勤并按通勤约束重排 match_results。need_commute 为 False 时早返回。"""
-    print("[commute_node] 开始执行...")
-
+    # 通勤未开启：静默跳过，不打印「开始执行」，避免日志误导
     if not get_plan_flag(state, "need_commute"):
         return state
+    print("[commute_node] 开始执行...")
 
     intent = state.get("commute_intent") or {}
     match_results = list(state.get("match_results") or [])
 
-    # 无通勤约束或无可处理岗位：不改动排序，直接返回
+    # 通勤已开启但抽取不到可用约束（如缺少可解析地址）：在报告中显式说明，而非静默无输出
     if not intent.get("has_commute_constraint"):
-        print("[commute_node] 无通勤约束，跳过通勤计算")
-        return state
+        reason = intent.get("error") or "缺少可解析的起点或终点地址"
+        note = f"通勤评估：当前{reason}，暂未计入通勤分。"
+        print(f"[commute_node] 无可用通勤约束，跳过通勤计算：{reason}")
+        new_state = dict(state)
+        # 把说明并入每条报告，保证「节点开启了就有可见输出」
+        results = []
+        for mr in match_results:
+            if isinstance(mr, dict) and isinstance(mr.get("report"), str):
+                mr = dict(mr)
+                mr["report"] = mr["report"].rstrip() + f"\n\n【通勤】{note}"
+            results.append(mr)
+        if results:
+            new_state["match_results"] = results
+        new_state["commute_note"] = note
+        return new_state
     if not match_results:
         return append_error(state, "commute_node: 无 match_results，无法计算通勤")
 

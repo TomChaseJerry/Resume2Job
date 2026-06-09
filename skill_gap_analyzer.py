@@ -146,9 +146,21 @@ def _resume_subset_for_prompt(resume_profile: dict) -> dict:
             "tasks": e.get("tasks") or [],
         })
 
+    # 学历/课程（弱证据来源）：课程通常写在 educations[].highlights，
+    # 提供给 LLM 后，课程里出现过的能力可判为 weak（学过但无项目实践），而非直接 missing。
+    educations = []
+    for ed in resume_profile.get("educations") or []:
+        if not isinstance(ed, dict):
+            continue
+        educations.append({
+            "major": ed.get("major"),
+            "courses_or_highlights": ed.get("highlights") or [],
+        })
+
     return {
         "skills": resume_profile.get("skills") or [],
         "skill_groups": resume_profile.get("skill_groups") or [],
+        "educations": educations,
         "projects": projects,
         "experiences": experiences,
         "research": resume_profile.get("research") or [],
@@ -166,7 +178,7 @@ SYSTEM_PROMPT = """你是一位专业求职辅导专家，擅长根据候选人�
 3. 不要输出解释性前后缀；
 4. 不得编造简历中不存在的信息；
 5. 每个技能都必须判断为 matched、weak 或 missing；
-6. resume_evidence 必须来自候选人简历内容（skills / projects / experiences / research / publications / awards），没有证据时返回空列表 []；
+6. resume_evidence 必须来自候选人简历内容（skills / skill_groups / educations 课程 / projects / experiences / research / publications / awards），没有证据时返回空列表 []；
 7. suggestion 必须具体、可执行；
 8. 只输出如下结构：
 {
@@ -182,13 +194,15 @@ SYSTEM_PROMPT = """你是一位专业求职辅导专家，擅长根据候选人�
   ]
 }
 
-【判断标准】
-matched：简历 skills / skill_groups / projects / experiences / research / publications / awards 中有直接证据支撑该能力。
-weak：简历中没有直接做过该技能，但存在可迁移基础。例如：
-  - GNN / 多源传感器建模 对「多传感器信息处理」是 weak；
-  - 深度学习 对「模仿学习 / 强化学习」是 weak；
-  - RAG / Agent 对「大模型应用」视证据强弱可为 matched 或 weak。
-missing：简历中完全没有相关描述，或只有非常泛的背景，无法支撑该岗位能力。
+【判断标准】（三档：matched / weak / missing，弱匹配应优先于直接判缺口）
+matched：简历 projects / experiences / research / publications 中有**项目或实践级**直接证据支撑该能力。
+weak（有基础但缺直接项目实践——满足以下任一即应判 weak，不得直接判 missing）：
+  - 技能栏 skills / skill_groups 中**明确列出**该技能，但没有对应项目 / 实习实践证据；
+  - educations.courses_or_highlights（课程）中出现该技能或其上位能力，但无项目实践（如课程「强化学习 / 自然语言处理 / 计算机视觉」）；
+  - 简历具备可迁移的相邻能力：GNN / 多源传感器建模 之于「多传感器信息处理」；深度学习之于「模仿学习 / 强化学习」；RAG / Agent 之于「大模型应用」。
+missing（缺口）：技能栏、课程、项目、经历中**都完全没有**该技能或其相邻能力的任何描述。
+注意：技能栏或课程里明确写了的能力（如机器学习、深度学习、NLP、CV），至少是 weak，不能判为 missing；
+仅在简历完全未提及时才判 missing。
 
 【重要约束】
 1. 不要因为候选人是计算机专业，就推断其掌握 Python / PyTorch / C++ / ROS 等技能；

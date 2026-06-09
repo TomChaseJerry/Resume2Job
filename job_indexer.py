@@ -1,18 +1,23 @@
 """
 岗位知识库构建模块（Job Indexer）
 
-批量解析 jd_folder 下的 .txt JD 文件，向量化后写入本地 ChromaDB，
-供后续岗位语义检索 / 匹配评分使用。
+批量解析 jd_folder 下的 .txt JD 文件，向量化后写入本地 ChromaDB（语义检索），
+同时把结构化元数据写入 SQLite jobs 表（精确查询 / 去重），两库并存。
 
 流程：
-    扫描 .txt -> 用 job_id 查重 -> 读取原文 -> parse_jd -> 构造 index_text + metadata
-        -> 获取 embedding -> 写入 chromadb -> 汇总日志
+    扫描 .txt -> 读取原文 -> 用 job_id 查重
+        ├─ 已在向量库：跳过向量化，仅从向量库 metadata 复用画像回填 SQLite jobs 表
+        └─ 新条目：parse_jd -> 构造 index_text + metadata -> 获取 embedding
+                    -> 写入 chromadb -> 写入 SQLite jobs 表
+    -> 汇总日志
 """
 
 import os
 import sys
 import json
+import sqlite3
 import argparse
+from datetime import datetime, timezone
 from typing import Optional
 
 import chromadb
@@ -20,13 +25,16 @@ from openai import OpenAI
 
 # 复用已有的 JD 解析器
 from jd_parser import parse_jd
+# 统一存储路径 + jobs 表写入工具（与运行时 jd_ingest_node 共用同一张表）
+from storage.paths import SQLITE_PATH
+from storage.jd_ingest import write_to_sqlite, compute_jd_hash
 
 
 # ===== 常量 =====
 EMBEDDING_MODEL = "text-embedding-v3"
 BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-DEFAULT_DB_PATH = "./job_db"
-DEFAULT_COLLECTION_NAME = "jobs"
+# 统一向量库：与 JD 入库（storage/jd_ingest.py）、画像缓存同处 data/，见 storage/paths.py
+from storage.paths import CHROMA_DIR as DEFAULT_DB_PATH, COLLECTION_NAME as DEFAULT_COLLECTION_NAME
 DEFAULT_JOB_PATH = './JDS'
 
 
@@ -152,6 +160,91 @@ def build_metadata(job_id: str, source_file: str, jd_profile: dict) -> dict:
     return {k: v for k, v in meta.items() if v is not None}
 
 
+# ===== SQLite jobs 表回填 =====
+def _utc_now_iso() -> str:
+    """当前 UTC 时间，ISO 8601 字符串。"""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _profile_from_chroma(collection, job_id: str) -> Optional[dict]:
+    """从向量库 metadata 的 jd_profile_json 复用已解析画像（用于回填已入库条目，零 token）。"""
+    try:
+        res = collection.get(ids=[job_id], include=["metadatas"])
+        metas = res.get("metadatas") or []
+        if metas and metas[0]:
+            raw = metas[0].get("jd_profile_json")
+            if raw:
+                return json.loads(raw)
+    except Exception as e:
+        print(f"[WARN] 从向量库读取 jd_profile 失败（{job_id}）：{e}")
+    return None
+
+
+def lookup_ingested_jd_profile(jd_text: str) -> Optional[dict]:
+    """按 JD 原文哈希在已入库岗位中查找并复用其结构化画像（零 token、跨链路一致性）。
+
+    用途：用户直接粘贴的 JD 若与知识库中某条已入库 JD 文本完全一致，则复用入库时
+    解析好的同一份 jd_profile，使「单 JD 评估」与「岗位推荐」两条链路看到**完全相同**
+    的结构化画像，避免因重复解析产生字段差异导致同一 JD 评分不一致。
+
+    流程：compute_jd_hash → SQLite jobs 按 jd_hash 取 job_id → 向量库 metadata 取 jd_profile。
+    任何环节失败或未命中都返回 None，由调用方回退到实时 parse_jd。
+    """
+    if not isinstance(jd_text, str) or not jd_text.strip():
+        return None
+    try:
+        jd_hash = compute_jd_hash(jd_text)
+        with sqlite3.connect(SQLITE_PATH) as conn:
+            row = conn.execute(
+                "SELECT job_id FROM jobs WHERE jd_hash = ? LIMIT 1", (jd_hash,)
+            ).fetchone()
+        if not row or not row[0]:
+            return None
+        job_id = row[0]
+        client = chromadb.PersistentClient(path=DEFAULT_DB_PATH)
+        collection = client.get_or_create_collection(name=DEFAULT_COLLECTION_NAME)
+        profile = _profile_from_chroma(collection, job_id)
+        if isinstance(profile, dict) and profile:
+            return profile
+    except Exception as e:
+        print(f"[WARN] 复用已入库 JD 画像失败，回退实时解析：{e}")
+    return None
+
+
+def backfill_jobs_table(job_id: str, jd_text: str, jd_profile: dict) -> None:
+    """把一条 JD 的结构化信息写入 SQLite jobs 表，与 Chroma 向量库并存。
+
+    幂等：write_to_sqlite 用 INSERT OR IGNORE，已存在则跳过；
+    失败仅打印警告，不影响向量入库主流程。source 标记为 batch_indexed，
+    便于与运行时用户粘贴入库（user_uploaded）区分来源。
+    """
+    if not isinstance(jd_profile, dict) or not jd_profile:
+        return
+    try:
+        location = jd_profile.get("location") if isinstance(jd_profile.get("location"), dict) else {}
+        hard = jd_profile.get("hard_skills") or []
+        tools = jd_profile.get("tools_or_frameworks") or []
+        skills = list(dict.fromkeys([*hard, *tools]))  # 合并去重、保序
+        job_dict = {
+            "job_id": job_id,
+            "company": jd_profile.get("company") or "unknown_company",
+            "title": jd_profile.get("title") or "unknown_title",
+            "city": location.get("city") or "",
+            "jd_text": jd_text,
+            "jd_hash": compute_jd_hash(jd_text),
+            "requirements": jd_profile.get("responsibilities") or [],
+            "skills": skills,
+            "source": "batch_indexed",
+            "embedding_id": job_id,
+            "created_at": _utc_now_iso(),
+        }
+        with sqlite3.connect(SQLITE_PATH) as conn:
+            write_to_sqlite(job_dict, conn)
+            conn.commit()
+    except Exception as e:
+        print(f"[WARN] 写入 SQLite jobs 表失败（{job_id}）：{e}")
+
+
 # ===== job_id 查重 =====
 def job_exists(collection, job_id: str) -> bool:
     """查询 ChromaDB 中是否已存在指定 job_id。"""
@@ -192,13 +285,7 @@ def index_jobs(jd_folder: str, db_path: str = DEFAULT_DB_PATH,
         job_id = os.path.splitext(fname)[0]
         print(f"[START] 正在处理：{fname}")
 
-        # 3) 优先用 job_id 查重，避免重复解析浪费 token
-        if job_exists(collection, job_id):
-            print(f"[SKIP] job_id 已存在：{job_id}")
-            skip_count += 1
-            continue
-
-        # 4) 读取原文
+        # 3) 读取原文（SQLite 回填也需要原文，故无论是否已在向量库都先读取）
         try:
             with open(fpath, "r", encoding="utf-8") as f:
                 jd_text = f.read()
@@ -209,6 +296,16 @@ def index_jobs(jd_folder: str, db_path: str = DEFAULT_DB_PATH,
 
         if not jd_text or not jd_text.strip():
             print(f"[SKIP] 文件为空：{fname}")
+            skip_count += 1
+            continue
+
+        # 4) 已在向量库：跳过向量化（省 token），但仍回填 SQLite jobs 表，
+        #    画像直接从向量库 metadata 复用，不重新调用 parse_jd
+        if job_exists(collection, job_id):
+            print(f"[SKIP] job_id 已存在（向量库），回填 SQLite：{job_id}")
+            cached_profile = _profile_from_chroma(collection, job_id)
+            if cached_profile:
+                backfill_jobs_table(job_id, jd_text, cached_profile)
             skip_count += 1
             continue
 
@@ -254,9 +351,12 @@ def index_jobs(jd_folder: str, db_path: str = DEFAULT_DB_PATH,
             fail_count += 1
             continue
 
+        # 9) 同步写入 SQLite jobs 表（结构化元数据，与向量库并存）
+        backfill_jobs_table(job_id, jd_text, jd_profile)
+
         company = metadata.get("company") or "未知公司"
         title = metadata.get("title") or "未知岗位"
-        print(f"[OK] 入库成功：{job_id} - {company} - {title}")
+        print(f"[OK] 入库成功（向量库 + SQLite）：{job_id} - {company} - {title}")
         ok_count += 1
 
     # 9) 汇总

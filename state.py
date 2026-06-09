@@ -14,7 +14,7 @@ LangGraph 工作流的全局 State 定义。
 本文件只定义 State 类型与初始化函数，不包含任何节点逻辑或具体业务实现。
 """
 
-from typing import TypedDict, Optional, List, Dict, Any, Literal
+from typing import TypedDict, Optional, List, Dict, Any, Literal, Union
 
 
 # ---------------------------------------------------------------------------
@@ -35,6 +35,8 @@ class PlanConfig(TypedDict):
     need_recommendation: bool # 是否需要生成推荐报告
     need_skill_gap: bool      # 是否需要技能差距分析
     need_commute: bool        # 是否需要通勤计算
+    need_learning_plan: bool  # 是否生成阶段化学习计划（默认关闭，用户提及才开启）
+    need_interview_prep: bool # 是否生成模拟面试题（默认关闭，用户提及才开启）
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +87,10 @@ class AgentState(TypedDict):
     jd_text: Optional[str]          # 用户直接粘贴的 JD 原文（场景 2）
     pdf_path: Optional[str]         # 用户上传的简历 PDF 路径（场景 1）
 
+    # ---------- 多轮对话记忆（Conversation Store 注入 / 回写） ----------
+    session_id: str                 # 会话标识，用于读写对话历史，默认 ""
+    messages: List[Dict[str, Any]]  # 本轮注入的历史消息 [{role, content, ...}]
+
     # ---------- 任务规划（Planner 节点写入） ----------
     task_type: Optional[Literal["job_recommendation", "jd_evaluation", "skill_gap_only"]]
     plan: Optional[PlanConfig]      # 各子任务是否执行的规划
@@ -97,6 +103,10 @@ class AgentState(TypedDict):
 
     # ---------- 简历画像（Resume Parser 节点写入） ----------
     resume_profile: Optional[Dict[str, Any]]  # 结构化简历
+
+    # ---------- 用户画像缓存（Profile Cache 节点写入） ----------
+    profile_id: str           # 当前使用的画像 profile_id，默认 ""
+    profile_source: str       # "new_upload" | "cached" | ""（未加载）
 
     # ---------- 岗位检索结果（Job Search 节点写入） ----------
     search_queries: Dict[str, str]            # 检索使用的查询语句
@@ -111,6 +121,16 @@ class AgentState(TypedDict):
     # ---------- Skill Gap 分析结果（Stage 4 / Skill Gap 节点写入） ----------
     skill_gaps: List[Dict[str, Any]]
 
+    # ---------- 学习路径规划（Learning Plan 节点写入，按需启用） ----------
+    learning_plan: Dict[str, Any]             # 基于 match_results[0].skill_gap 生成的阶段化学习计划
+
+    # ---------- 面试辅助（Interview Prep 节点写入，按需启用） ----------
+    interview_prep: Dict[str, Any]            # 模拟面试题（generate_interview_questions 输出）
+
+    # ---------- JD 自动入库结果（JD Ingest 节点写入） ----------
+    ingested_job_id: str      # 本次入库或复用的 job_id，默认 ""
+    jd_is_duplicate: bool     # 本次 JD 是否为重复，默认 False
+
     # ---------- 通勤计算结果（后续 Commute 模块写入） ----------
     commute_results: List[Dict[str, Any]]
 
@@ -118,7 +138,8 @@ class AgentState(TypedDict):
     final_response: Optional[str]             # 汇总后的最终回复
 
     # ---------- 错误信息（任意节点可追加） ----------
-    errors: List[str]
+    # 兼容两种写法：纯文本错误（早期节点）与结构化错误 dict（如 {"node", "error", "step"}）
+    errors: List[Union[str, Dict[str, Any]]]
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +153,8 @@ def get_initial_state(
     city_filter: Optional[str] = None,
     direction_filter: Optional[str] = None,
     education_filter: Optional[str] = None,
+    session_id: str = "",
+    messages: Optional[List[Dict[str, Any]]] = None,
 ) -> AgentState:
     """
     构造工作流的初始 `AgentState`。
@@ -157,6 +180,10 @@ def get_initial_state(
         jd_text=jd_text,
         pdf_path=pdf_path,
 
+        # 多轮对话记忆
+        session_id=session_id,
+        messages=messages or [],
+
         # 任务规划：由 Planner 节点后续填充
         task_type=None,
         plan=None,
@@ -175,6 +202,10 @@ def get_initial_state(
         # 简历画像：尚未生成
         resume_profile=None,
 
+        # 用户画像缓存：尚未加载
+        profile_id="",
+        profile_source="",
+
         # 岗位检索结果：列表 / 字典初始化为空
         search_queries={},
         candidate_jobs=[],
@@ -187,6 +218,16 @@ def get_initial_state(
 
         # Skill Gap 分析结果
         skill_gaps=[],
+
+        # 学习路径规划：尚未生成
+        learning_plan={},
+
+        # 面试辅助：尚未生成
+        interview_prep={},
+
+        # JD 自动入库结果：尚未入库
+        ingested_job_id="",
+        jd_is_duplicate=False,
 
         # 通勤计算结果
         commute_results=[],

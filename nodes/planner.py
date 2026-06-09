@@ -32,6 +32,10 @@ from state import AgentState, PlanConfig
 # 三个合法的任务类型
 VALID_TASK_TYPES = ("job_recommendation", "jd_evaluation", "skill_gap_only")
 
+# 意图分类用更快的轻量模型：输出仅三选一标签，不需要 qwen-max 的重推理，
+# qwen-plus 足够且明显更快。可用环境变量覆盖（回退 qwen-max）。
+INTENT_MODEL_NAME = os.environ.get("RESUME2JOB_INTENT_MODEL", "qwen-plus")
+
 # 通勤相关关键词：命中任意一个则认为用户关心通勤，需开启 need_commute
 COMMUTE_KEYWORDS = (
     "通勤", "地铁", "距离", "多久到", "小时以内",
@@ -42,6 +46,16 @@ COMMUTE_KEYWORDS = (
 JD_EVAL_KEYWORDS = ("适合", "分析", "能不能投", "匹配", "评价")
 SKILL_GAP_KEYWORDS = ("差距", "缺哪些", "补什么", "skill gap", "能力差")
 JOB_REC_KEYWORDS = ("推荐", "找岗位", "找实习", "岗位推荐", "适合我的岗位")
+
+# 可选增强模块关键词：命中才开启对应工具（默认关闭）
+LEARNING_PLAN_KEYWORDS = (
+    "学习路径", "学习计划", "学习规划", "学习路线", "进阶路线",
+    "怎么学", "如何学", "如何提升", "提升计划", "补齐", "补强",
+)
+INTERVIEW_KEYWORDS = (
+    "面试", "面试题", "模拟面试", "面试准备", "面试辅导", "面试问题",
+    "面经", "怎么答", "作答思路", "面试官",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -121,14 +135,35 @@ def _has_commute_intent(user_query: str) -> bool:
     return any(kw in query for kw in COMMUTE_KEYWORDS)
 
 
+def _format_history(messages: Optional[list], max_chars: int = 800) -> str:
+    """把 state['messages'] 渲染为简短对话文本，供意图识别参考上下文。超长保留最近部分。"""
+    if not messages:
+        return ""
+    label = {"user": "用户", "assistant": "助手"}
+    lines = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        content = str(m.get("content") or "").strip()
+        if content:
+            lines.append(f"{label.get(m.get('role'), m.get('role'))}：{content}")
+    text = "\n".join(lines)
+    if len(text) > max_chars:
+        text = "…（更早对话省略）\n" + text[-max_chars:]
+    return text
+
+
 def _llm_classify_intent(
     user_query: str,
     has_jd: bool,
     has_pdf: bool,
+    history_text: str = "",
 ) -> str:
     """
     调用 LLM 做意图分类，返回清洗后的 task_type（可能为空字符串）。
 
+    多轮场景下传入 history_text（最近对话），帮助理解依赖上下文的追问
+    （如「换成上海的」「那第二个岗位呢」）。
     若环境变量缺失或调用失败，抛出异常交由上层捕获并走规则兜底。
     """
     api_key = os.environ.get("DASHSCOPE_API_KEY")
@@ -140,14 +175,14 @@ def _llm_classify_intent(
     from langchain_openai import ChatOpenAI
 
     llm = ChatOpenAI(
-        model="qwen-max",
+        model=INTENT_MODEL_NAME,
         openai_api_key=api_key,
         openai_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
         temperature=0,
     )
 
     system_prompt = (
-        "你是一个求职助手的意图分类器。你的任务是根据用户问题和是否提供 JD，"
+        "你是一个求职助手的意图分类器。你的任务是结合最近对话历史、用户问题和是否提供 JD，"
         "判断当前任务类型。\n"
         "你只能输出以下三个值之一：\n"
         "job_recommendation\n"
@@ -156,11 +191,13 @@ def _llm_classify_intent(
         "不要输出任何解释、标点、Markdown 或额外文字。"
     )
 
+    history_block = f"## 最近对话\n{history_text}\n\n" if history_text else ""
     user_prompt = (
-        f"用户问题：{user_query}\n"
+        f"{history_block}"
+        f"## 本轮用户问题\n{user_query}\n"
         f"是否提供了 JD 原文：{'有' if has_jd else '无'}\n"
         f"是否提供了简历 PDF：{'有' if has_pdf else '无'}\n\n"
-        "请判断任务类型，只输出：\n"
+        "请结合上下文判断任务类型，只输出：\n"
         "job_recommendation / jd_evaluation / skill_gap_only"
     )
 
@@ -198,12 +235,14 @@ def intent_router_node(state: AgentState) -> AgentState:
     has_jd = bool(jd_text)
     has_pdf = bool(pdf_path)
 
+    history_text = _format_history(state.get("messages"))
+
     task_type = ""
     llm_failed_reason = None
 
-    # 1. 优先尝试 LLM 分类
+    # 1. 优先尝试 LLM 分类（带最近对话上下文）
     try:
-        task_type = _llm_classify_intent(user_query, has_jd, has_pdf)
+        task_type = _llm_classify_intent(user_query, has_jd, has_pdf, history_text)
     except Exception as exc:  # 环境变量缺失 / 网络 / SDK 错误等
         llm_failed_reason = str(exc)
         task_type = ""
@@ -293,6 +332,11 @@ def _build_plan(
     # 通勤关键词检测：命中则开启 need_commute（对所有任务类型生效）
     if _has_commute_intent(user_query):
         plan["need_commute"] = True
+
+    # 可选增强模块：默认关闭，仅当用户问题中出现相应说法时才开启（对所有任务类型生效）
+    q = user_query or ""
+    plan["need_learning_plan"] = any(kw in q for kw in LEARNING_PLAN_KEYWORDS)
+    plan["need_interview_prep"] = any(kw in q for kw in INTERVIEW_KEYWORDS)
 
     return plan
 

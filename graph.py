@@ -14,12 +14,18 @@ graph.py
 主流程：
     START
       ↓
-    intent_router  -> planner -> resume_parser
+    intent_router -> planner -> commute_planner -> resume_parser -> profile_cache
       ↓ (条件路由 route_job_source)
-      ├── job_retriever → jd_analyzer → match_scorer → END
-      ├── jd_input      → jd_analyzer → match_scorer → END
-      ├── jd_analyzer   → match_scorer → END
+      ├── job_retriever → jd_analyzer → match_scorer → commute → learning_plan → interview_prep → END
+      ├── jd_input      → jd_analyzer → match_scorer → commute → learning_plan → interview_prep → END
+      ├── jd_analyzer   → match_scorer → commute → learning_plan → interview_prep → END
       └── END
+
+    其中：
+      - profile_cache：在 resume_parser 之后、岗位来源路由之前，
+        负责「复用缓存画像（未上传时）/ 保存新画像（已上传时）」；
+      - learning_plan：在 commute 之后、END 之前，
+        基于 match_results[0].skill_gap 生成阶段化学习计划（无结果时自动跳过）。
 """
 
 import argparse
@@ -36,6 +42,10 @@ from nodes.executor import (
     match_scorer_node,
 )
 from nodes.commute import commute_planner_node, commute_node
+from nodes.learning_plan_node import learning_plan_node
+from nodes.interview_prep import interview_prep_node
+from storage.profile_cache import profile_cache_node
+from storage import conversation_store
 
 
 # ---------------------------------------------------------------------------
@@ -94,11 +104,14 @@ def build_graph():
     graph.add_node("planner", planner_node)
     graph.add_node("commute_planner", commute_planner_node)   # 早节点：通勤意图 + 规划检索
     graph.add_node("resume_parser", resume_parser_node)
+    graph.add_node("profile_cache", profile_cache_node)       # 画像缓存：复用 / 保存用户画像
     graph.add_node("job_retriever", job_retriever_node)
     graph.add_node("jd_input", jd_input_node)
     graph.add_node("jd_analyzer", jd_analyzer_node)
     graph.add_node("match_scorer", match_scorer_node)
     graph.add_node("commute", commute_node)                   # 晚节点：通勤计算 + 过滤排序
+    graph.add_node("learning_plan", learning_plan_node)       # 可选：阶段化学习计划（默认关闭）
+    graph.add_node("interview_prep", interview_prep_node)     # 可选：模拟面试题（默认关闭）
 
     # 2. 固定边：入口 -> 意图识别 -> 规划 -> 通勤规划 -> 简历解析
     #    commute_planner 在 resume_parser 之前，使住址城市能回填检索参数（need_commute 为 False 时早返回）
@@ -106,10 +119,12 @@ def build_graph():
     graph.add_edge("intent_router", "planner")
     graph.add_edge("planner", "commute_planner")
     graph.add_edge("commute_planner", "resume_parser")
+    #    profile_cache 紧跟 resume_parser：已上传则保存新画像，未上传则复用缓存画像
+    graph.add_edge("resume_parser", "profile_cache")
 
-    # 3. 条件路由：resume_parser 之后按 plan 决定岗位来源分支
+    # 3. 条件路由：profile_cache 之后按 plan 决定岗位来源分支
     graph.add_conditional_edges(
-        "resume_parser",
+        "profile_cache",
         route_job_source,
         {
             "job_retriever": "job_retriever",
@@ -119,16 +134,96 @@ def build_graph():
         },
     )
 
-    # 4. 固定边：各岗位来源分支汇聚到 jd_analyzer -> match_scorer -> commute -> END
+    # 4. 固定边：各岗位来源分支汇聚到 jd_analyzer -> match_scorer -> commute -> learning_plan -> END
     #    commute 在 match_scorer 之后（需 final_score 排序）；need_commute 为 False 时早返回
+    #    learning_plan 在 commute 之后（针对通勤重排后的首选岗位）；无 match_results 时自动跳过
     graph.add_edge("job_retriever", "jd_analyzer")
     graph.add_edge("jd_input", "jd_analyzer")
     graph.add_edge("jd_analyzer", "match_scorer")
     graph.add_edge("match_scorer", "commute")
-    graph.add_edge("commute", END)
+    graph.add_edge("commute", "learning_plan")
+    #    learning_plan / interview_prep 均为可选增强，各自按 plan 开关早返回
+    graph.add_edge("learning_plan", "interview_prep")
+    graph.add_edge("interview_prep", END)
 
     # 5. 编译并返回
     return graph.compile()
+
+
+# ---------------------------------------------------------------------------
+# 多轮对话：单轮执行封装（加载历史 -> 执行图 -> 记录对话）
+# ---------------------------------------------------------------------------
+
+def _summarize_response(final_state: AgentState) -> str:
+    """从最终 State 提炼一段面向用户/可入库的助手回复摘要。"""
+    # 1. 通勤等汇总文案优先
+    final_response = (final_state.get("final_response") or "").strip()
+    parts = []
+    if final_response:
+        parts.append(final_response)
+
+    # 2. 岗位结果摘要（取前 3 条）
+    match_results = final_state.get("match_results") or []
+    if match_results:
+        lines = []
+        for mr in match_results[:3]:
+            jd = mr.get("jd_profile") or {}
+            score = (mr.get("match_score") or {}).get("final_score")
+            company = jd.get("company") or "未知公司"
+            title = jd.get("title") or "未知岗位"
+            lines.append(f"{company} - {title}（匹配度 {score}）")
+        parts.append("为你匹配到以下岗位：\n" + "\n".join(lines))
+
+    # 3. 学习计划一句话（若有）
+    plan = final_state.get("learning_plan") or {}
+    if plan.get("overall_suggestion"):
+        parts.append("学习建议：" + plan["overall_suggestion"])
+
+    if not parts:
+        return "本轮未生成岗位结果。"
+    return "\n\n".join(parts)
+
+
+def run_turn(
+    app,
+    user_query: str,
+    session_id: str = conversation_store.DEFAULT_SESSION_ID,
+    pdf_path=None,
+    jd_text=None,
+    top_k: int = 5,
+    city_filter=None,
+    direction_filter=None,
+    education_filter=None,
+) -> AgentState:
+    """执行一轮多轮对话：
+
+        1. 按 session_id 读取历史对话，注入 state["messages"]（供意图识别等参考上下文）；
+        2. 执行工作流；
+        3. 把本轮 user 提问与 assistant 回复摘要写入对话记录（持久化）。
+
+    画像复用由 profile_cache_node 负责（首轮上传后续可不传简历），
+    对话上下文由本函数 + conversation_store 负责，二者共同构成「多轮记忆」。
+    """
+    history = conversation_store.load_history(session_id)
+
+    initial_state = get_initial_state(
+        user_query=user_query,
+        pdf_path=pdf_path,
+        jd_text=jd_text,
+        top_k=top_k,
+        city_filter=city_filter,
+        direction_filter=direction_filter,
+        education_filter=education_filter,
+        session_id=session_id,
+        messages=history,
+    )
+
+    final_state = app.invoke(initial_state)
+
+    # 记录本轮对话（user + assistant）
+    response = _summarize_response(final_state)
+    conversation_store.append_turn(session_id, user_query, response)
+    return final_state
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +242,8 @@ def main():
     parser.add_argument("--city", default=None, help="城市过滤条件")
     parser.add_argument("--direction", default=None, help="岗位方向过滤条件")
     parser.add_argument("--education", default=None, help="学历过滤条件")
+    parser.add_argument("--session_id", default=conversation_store.DEFAULT_SESSION_ID,
+                        help="会话 ID（同一 ID 跨次运行共享对话历史，实现多轮记忆）")
     args = parser.parse_args()
 
     # 如提供 jd_file，则 UTF-8 读取其内容作为 jd_text
@@ -155,9 +252,12 @@ def main():
         with open(args.jd_file, "r", encoding="utf-8") as f:
             jd_text = f.read()
 
-    # 初始化全局 State
-    initial_state = get_initial_state(
+    # 构建工作流，并以「单轮对话」方式执行（自动加载历史 + 记录本轮）
+    app = build_graph()
+    final_state = run_turn(
+        app,
         user_query=args.query,
+        session_id=args.session_id,
         pdf_path=args.pdf_path,
         jd_text=jd_text,
         top_k=args.top_k,
@@ -165,10 +265,6 @@ def main():
         direction_filter=args.direction,
         education_filter=args.education,
     )
-
-    # 构建并执行工作流
-    app = build_graph()
-    final_state = app.invoke(initial_state)
 
     # 打印结果
     match_results = final_state.get("match_results") or []

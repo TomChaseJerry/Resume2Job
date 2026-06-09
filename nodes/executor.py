@@ -16,6 +16,7 @@ nodes/executor.py
 """
 
 import json
+import concurrent.futures
 from typing import Optional
 
 from state import AgentState, MatchResult
@@ -24,7 +25,8 @@ from state import AgentState, MatchResult
 from resume_parser import parse_resume
 from jd_parser import parse_jd
 from job_retriever import retrieve_jobs
-from match_scorer import score_match
+from job_indexer import lookup_ingested_jd_profile
+from match_scorer import score_match, calculate_skill_score
 from skill_gap_analyzer import analyze_skill_gap
 # Stage 4：完整报告优先用 generate_full_report；generate_recommendation 保留作兜底
 from recommendation_writer import generate_full_report, generate_recommendation
@@ -226,6 +228,15 @@ def jd_input_node(state: AgentState) -> AgentState:
         return state
 
     new_state = dict(state)
+
+    # 跨链路一致性：若粘贴的 JD 与知识库中某条已入库 JD 文本完全一致，直接复用入库画像，
+    # 使「单 JD 评估」与「岗位推荐」看到同一份结构化 JD，评分不再因重复解析而漂移；同时省一次 LLM。
+    reused = lookup_ingested_jd_profile(jd_text)
+    if reused:
+        new_state["jd_profiles"] = [reused]
+        print("[jd_input_node] 命中已入库 JD（按文本哈希），复用入库画像，跳过解析")
+        return new_state
+
     try:
         jd_profile = parse_jd(jd_text)
         if not jd_profile:
@@ -343,6 +354,43 @@ def _safe_full_report(jd_profile: dict, match_score: dict, skill_gap: dict,
         return ""
 
 
+def _evaluate_one_job(resume_profile: dict, jd_profile: dict, job_id: str,
+                      errors: list) -> tuple:
+    """对单个岗位完成「评分 + 技能差距 + 报告」，并发独立的 LLM 调用以降低串行延迟。
+
+    依赖关系：
+        - score_match 内部的 project_score / direction_score 已并发；
+        - skill_gap 只依赖规则计算的 skill_score（与评分 LLM 无依赖），
+          因此把它和 score_match 一起并发，三路 LLM 同时跑；
+        - report 依赖评分与 skill_gap 的全部结果，最后串行生成。
+
+    返回 (match_score, skill_gap, report)；score_match 失败时返回 (None, None, None)
+    并已把错误写入 errors（该岗位由调用方跳过）。
+    """
+    # skill_gap 只读 match_result["skill_score"]，这里先用规则算好喂给它，
+    # 使其无需等待 score_match 完成即可并发启动。skill_score 为确定性规则计算，
+    # 与 score_match 内部重算结果一致，故 skill_gap 输出不变。
+    skill_score_pre = calculate_skill_score(resume_profile, jd_profile)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        f_match = ex.submit(score_match, resume_profile, jd_profile)
+        f_gap = ex.submit(
+            _safe_skill_gap, resume_profile, jd_profile,
+            {"skill_score": skill_score_pre}, job_id, errors,
+        )
+        try:
+            match_score = f_match.result()
+        except Exception as exc:
+            errors.append(f"match_scorer_node: 岗位 {job_id} 评分失败：{exc}")
+            f_gap.result()  # 回收已提交的 skill_gap（其异常已被 _safe_skill_gap 自行处理）
+            return None, None, None
+        skill_gap = f_gap.result()
+
+    # 完整报告（full_report 失败回退旧版）——依赖前两步结果，串行
+    report = _safe_full_report(jd_profile, match_score, skill_gap, job_id, errors)
+    return match_score, skill_gap, report
+
+
 def match_scorer_node(state: AgentState) -> AgentState:
     """
     对每个岗位执行：匹配评分 -> 技能差距分析 -> 生成完整报告（Stage 4 固定内部链路）。
@@ -377,18 +425,13 @@ def match_scorer_node(state: AgentState) -> AgentState:
 
     for idx, jd_profile in enumerate(jd_profiles):
         job_id = get_job_id(jd_profile, idx)
-        try:
-            # 1. 匹配评分（失败则跳过该岗位）
-            match_score = score_match(resume_profile, jd_profile)
-        except Exception as exc:
-            errors.append(f"match_scorer_node: 岗位 {job_id} 评分失败：{exc}")
+
+        # 评分 + 技能差距 + 报告：内部已对独立 LLM 调用并发（详见 _evaluate_one_job）
+        match_score, skill_gap, report = _evaluate_one_job(
+            resume_profile, jd_profile, job_id, errors,
+        )
+        if match_score is None:  # 评分失败 -> 跳过该岗位
             continue
-
-        # 2. 技能差距分析（失败不跳过，返回带 error 的空结构）
-        skill_gap = _safe_skill_gap(resume_profile, jd_profile, match_score, job_id, errors)
-
-        # 3. 完整报告（full_report 失败回退旧版）
-        report = _safe_full_report(jd_profile, match_score, skill_gap, job_id, errors)
 
         match_results.append(
             MatchResult(

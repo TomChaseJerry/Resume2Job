@@ -38,6 +38,38 @@ MATCH_LEVEL_CN = {
 }
 
 
+# ===== 统一的「分数 → 档位」映射（单一事实来源）=====
+# 推荐等级展示文案、LLM/兜底语气都由这里派生，保证「分数 / 等级 / 投递建议」三者一致，
+# 不再出现「72 分却标低优先级」这类分数与等级矛盾的情况。
+def _score_tier(final_score: int) -> str:
+    if final_score >= 85:
+        return "strong"
+    if final_score >= 75:
+        return "recommend"
+    if final_score >= 65:
+        return "consider"
+    if final_score >= 50:
+        return "low"
+    return "negative"
+
+
+_TIER_DISPLAY = {
+    "strong": "强烈推荐",
+    "recommend": "推荐投递",
+    "consider": "建议考虑",
+    "low": "低优先级",
+    "negative": "暂不推荐",
+}
+
+_TIER_TONE = {
+    "strong": "positive",
+    "recommend": "positive",
+    "consider": "neutral",
+    "low": "cautious",
+    "negative": "negative",
+}
+
+
 # ===== 学历相关风险类型（用于过滤）=====
 _DEGREE_RISK_TYPES = {"学历门槛", "学历要求"}
 
@@ -56,21 +88,6 @@ _RISK_PRIORITY = {
     "科研产出": 9,
     "竞赛经历": 10,
     "学历门槛": 11,
-}
-
-
-# ===== 用于 cautious 降级判断的"核心方向技能"集合 =====
-_CORE_DIRECTION_SKILLS = {
-    "强化学习", "rl", "reinforcement learning",
-    "模仿学习", "imitation learning",
-    "元学习", "meta learning", "meta-learning",
-    "自然语言处理", "nlp",
-    "计算机视觉", "cv",
-    "推荐算法", "推荐系统", "recsys",
-    "rag", "检索增强生成",
-    "agent", "智能体",
-    "多模态", "multimodal",
-    "大模型", "llm",
 }
 
 
@@ -113,33 +130,16 @@ def map_match_level(level: str) -> str:
     return MATCH_LEVEL_CN.get(level.strip().lower(), "未知")
 
 
-# ===== 1. 语气降级判断 =====
+# ===== 1. 语气判断（与推荐等级同源，均由 final_score 档位派生）=====
 def adjust_recommendation_tone(match_result: dict) -> str:
-    """根据评分细节决定语气：positive / neutral / cautious / negative。"""
+    """根据综合分档位决定语气：positive / neutral / cautious / negative。
+
+    与 _display_match_level 同源（都走 _score_tier），保证「等级」与「语气/投递建议」
+    不会自相矛盾（例如 72 分既显示『推荐投递』又给出『暂不优先投递』的建议）。
+    """
     if not isinstance(match_result, dict):
         return "neutral"
-
-    level = (match_result.get("match_level") or "").strip().lower()
-    if level == "recommended":
-        return "positive"
-    if level == "not_recommended":
-        return "negative"
-
-    # maybe 分支：根据方向分 / 技能分 / missing_skills 决定是否降级到 cautious
-    direction_score = _safe_int((match_result.get("direction_score") or {}).get("score"))
-    skill = match_result.get("skill_score") or {}
-    skill_score = _safe_int(skill.get("score"))
-    missing = skill.get("missing_skills") or []
-    missing_low = {str(x).strip().lower() for x in missing if isinstance(x, str)}
-
-    if direction_score <= 30:
-        return "cautious"
-    if skill_score < 50:
-        return "cautious"
-    if missing_low & _CORE_DIRECTION_SKILLS:
-        return "cautious"
-
-    return "neutral"
+    return _TIER_TONE.get(_score_tier(_safe_int(match_result.get("final_score"))), "neutral")
 
 
 # ===== 7. evidence 格式化（修正标点重复）=====
@@ -452,6 +452,11 @@ SYSTEM_PROMPT_WRITER = """你是一位专业求职顾问，擅长根据岗位 JD
 
 【内容约束】
 3. 不得编造输入中不存在的经历、技能、岗位要求或风险；
+3.1 【硬性门槛忠实性·强约束】岗位的任何硬性门槛——实习时长 / 到岗月数 / 每周到岗天数 /
+   学历 / 工作年限 / 论文 / 竞赛 / 城市 / 户籍 / 届别等——只能引用输入字段中明确给出的原文
+   （education_requirement、experience_requirement，或风险信息 risk_analysis / jd_risk_points 中的条目）。
+   输入里没有出现的门槛**一律禁止提及**；尤其严禁凭空写出「需至少 N 个月实习」「每周到岗 X 天」
+   「需 N 年经验」这类输入中不存在的时间 / 年限要求。拿不准时宁可不写，也不要编造。
 4. 描述"项目经历"时，只能基于 projects / project_score.evidence 等项目相关字段；
    - 求职意向（job_preferences.intentions）、技能标签或课程背景**不能**写成项目经历；
    - **严禁**因为 direction_evidence / 求职意向里出现「NLP / 自然语言处理 / CV」等字样，
@@ -549,7 +554,9 @@ def _build_user_prompt_for_writer(
         '{\n  "reason": "2~3 句话推荐理由",\n  "suggestion": "1~2 句话投递建议"\n}\n\n'
         "请直接输出 JSON 对象本体，不要任何额外文字或 Markdown 包装。\n"
         "再次提醒：suppressed_unsafe_skills 列出的技能不要在 reason / suggestion 中强化；"
-        "描述项目经历时只能引用 projects / project_evidence 相关内容，不要把 NLP/CV 等求职意向当作项目方向。"
+        "描述项目经历时只能引用 projects / project_evidence 相关内容，不要把 NLP/CV 等求职意向当作项目方向；"
+        "岗位硬性门槛（实习时长 / 经验年限 / 学历 / 论文 / 竞赛 / 城市等）只能引用上面的"
+        "岗位基本信息与风险信息原文，输入中没有的门槛绝对不要写。"
     )
 
 
@@ -588,14 +595,16 @@ def call_llm_writer(
     return validate_writer_result(parsed, match_result, tone=tone)
 
 
-# ===== 推荐等级展示（含 cautious 后缀）=====
+# ===== 推荐等级展示（统一由 final_score 档位决定）=====
 def _display_match_level(match_result: dict) -> str:
-    """推荐等级中文展示；cautious 时追加「（低优先级）」。"""
-    base = map_match_level(match_result.get("match_level") or "")
-    tone = adjust_recommendation_tone(match_result)
-    if tone == "cautious" and base == "建议考虑":
-        return f"{base}（低优先级）"
-    return base
+    """推荐等级中文展示，直接由综合分档位映射（强烈推荐 / 推荐投递 / 可考虑 / 谨慎投递 / 暂不推荐）。
+
+    取代旧的「maybe + cautious 追加（低优先级）」逻辑，确保同一分数始终对应同一等级，
+    分数与等级不再矛盾。
+    """
+    if not isinstance(match_result, dict):
+        return "未知"
+    return _TIER_DISPLAY.get(_score_tier(_safe_int(match_result.get("final_score"))), "未知")
 
 
 # ===== 技能差距分析展示 =====

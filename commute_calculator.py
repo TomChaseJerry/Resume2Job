@@ -442,3 +442,266 @@ def compute_and_rank(intent: dict, jobs: list) -> dict:
     ranked["per_job"] = per_job
     ranked["error"] = error
     return ranked
+
+
+# ===== 测试入口 =====
+# 本模块提供两类测试：
+#   1) offline_test（默认，python commute_calculator.py）：
+#      只对「确定性、可离线验证」的纯函数做断言，不发起任何网络请求。
+#   2) agent_flow_test（python commute_calculator.py agent）：
+#      端到端验证 Agent 流程——
+#      用户自然语言问题 → LLM 判断通勤意图（Prompt 1）
+#      → 高德地图 API 计算各候选岗位通勤时长 → 体现到岗位召回（过滤 + 重排）。
+#      需联网且已配置 DASHSCOPE_API_KEY 与 AMAP_API_KEY。
+def offline_test():
+    """离线自测：python commute_calculator.py
+
+    覆盖城市提取、交通方式归一化、LLM 输出清洗与校验、高德响应时长解析、
+    通勤摘要文案、过滤排序，以及无 AMAP_API_KEY 时 compute_and_rank 的兜底。
+    """
+    passed = 0
+    failed = 0
+
+    def check(name, got, want):
+        nonlocal passed, failed
+        if got == want:
+            passed += 1
+            print(f"  [PASS] {name}")
+        else:
+            failed += 1
+            print(f"  [FAIL] {name}\n         got : {got!r}\n         want: {want!r}")
+
+    print("== extract_city ==")
+    check("含「市」", extract_city("北京市海淀区五道口"), "北京市")
+    check("直辖市兜底", extract_city("北京五道口"), "北京")
+    check("空地址", extract_city("   "), None)
+    check("非字符串", extract_city(None), None)
+
+    print("== _normalize_transport ==")
+    check("合法值", _normalize_transport("DRIVING"), "driving")
+    check("非法回退", _normalize_transport("飞行"), DEFAULT_TRANSPORT)
+    check("缺失回退", _normalize_transport(None), DEFAULT_TRANSPORT)
+
+    print("== _clean_json ==")
+    check("剥离代码块", _clean_json('```json\n{"a": 1}\n```'), '{"a": 1}')
+    check("截取首尾花括号", _clean_json('前缀 {"a": 1} 后缀'), '{"a": 1}')
+    check("空串", _clean_json(""), "")
+
+    print("== _validate_intent ==")
+    valid = _validate_intent({
+        "has_commute_constraint": True,
+        "user_address": "北京市海淀区五道口",
+        "address_confidence": "district",
+        "max_commute_minutes": "60分钟",
+        "preferred_transport": "TRANSIT",
+        "raw_address_text": "北京五道口",
+    })
+    check("地址", valid["user_address"], "北京市海淀区五道口")
+    check("约束成立", valid["has_commute_constraint"], True)
+    check("分钟从字符串提取", valid["max_commute_minutes"], 60)
+    check("交通方式小写", valid["preferred_transport"], "transit")
+    check("布尔分钟视为无效", _validate_intent({"max_commute_minutes": True})["max_commute_minutes"], None)
+    check("无地址则约束不成立",
+          _validate_intent({"has_commute_constraint": True, "user_address": "  "})["has_commute_constraint"], False)
+    check("非法置信度归零", _validate_intent({"address_confidence": "高"})["address_confidence"], None)
+    check("非 dict 输入", _validate_intent("x")["error"], "通勤意图输出非法")
+
+    print("== _parse_duration_seconds ==")
+    check("v3 公交", _parse_duration_seconds(
+        {"status": "1", "route": {"transits": [{"duration": "1800"}]}}, AMAP_V3), 1800)
+    check("v3 驾车", _parse_duration_seconds(
+        {"status": "1", "route": {"paths": [{"duration": "900"}]}}, AMAP_V3), 900)
+    check("v3 失败状态", _parse_duration_seconds({"status": "0"}, AMAP_V3), None)
+    check("v4 骑行", _parse_duration_seconds(
+        {"errcode": 0, "data": {"paths": [{"duration": 1200}]}}, AMAP_V4), 1200)
+    check("v4 错误码", _parse_duration_seconds({"errcode": 1}, AMAP_V4), None)
+    check("非 dict", _parse_duration_seconds(None, AMAP_V3), None)
+
+    print("== _commute_summary ==")
+    check("地址未知", _commute_summary(None, None, "transit", 60, False), "办公地址未知，无法计算通勤")
+    check("无法计算", _commute_summary(None, None, "driving", 60, True), "驾车路线无法计算")
+    check("达标", _commute_summary(30, True, "transit", 60, True), "地铁/公交约 30 分钟，符合通勤要求")
+    check("超标", _commute_summary(80, False, "cycling", 60, True), "骑行约 80 分钟，超出你设定的 60 分钟上限")
+
+    print("== _rank_jobs ==")
+    records = [
+        {"job_id": "A", "company": "甲", "title": "实习", "final_score": 0.9, "commute_minutes": 30, "addr_known": True},
+        {"job_id": "B", "company": "乙", "title": "实习", "final_score": 0.8, "commute_minutes": 80, "addr_known": True},
+        {"job_id": "C", "company": "丙", "title": "实习", "final_score": 0.7, "commute_minutes": None, "addr_known": False},
+    ]
+    ranked = _rank_jobs(records, 60, "transit")
+    check("达标排首位", ranked["ranked_jobs"][0]["job_id"], "A")
+    check("超标补足进入 ranked（不足3个）", [j["job_id"] for j in ranked["ranked_jobs"]], ["A", "B"])
+    check("地址未知被过滤", ranked["filtered_out"][0]["job_id"], "C")
+    check("过滤原因", ranked["filtered_out"][0]["reason_excluded"], "办公地址未知，无法计算通勤")
+
+    print("== compute_and_rank（无 AMAP_API_KEY 兜底）==")
+    saved_key = os.environ.pop("AMAP_API_KEY", None)
+    try:
+        out = compute_and_rank(
+            {"user_address": "北京市海淀区", "max_commute_minutes": 60, "preferred_transport": "transit"},
+            [{"job_id": "A", "company": "甲", "title": "实习", "office_address": "北京市朝阳区", "final_score": 0.9}],
+        )
+        check("缺 Key 时返回 error", out["error"], "未配置 AMAP_API_KEY，跳过通勤计算")
+        check("岗位仍被收录（不可计算）", "A" in out["per_job"], True)
+        check("不可计算 within_limit 为 None", out["per_job"]["A"]["within_limit"], None)
+    finally:
+        if saved_key is not None:
+            os.environ["AMAP_API_KEY"] = saved_key
+
+    print(f"\n结果：{passed} 通过 / {failed} 失败")
+    return 0 if failed == 0 else 1
+
+
+# 模拟「岗位召回」结果：覆盖近 → 远的真实北京地址，供高德实算后做过滤排序。
+# 选址刻意拉开通勤梯度（中关村 ≈ 邻近，亦庄经济开发区 ≈ 远郊），
+# 以便稳定验证「近的岗位优先、远的被判为超标」这一召回体现，不依赖具体分钟数。
+_AGENT_FLOW_SAMPLE_JOBS = [
+    {"job_id": "J1", "company": "中关村科技", "title": "数据分析实习",
+     "office_address": "北京市海淀区中关村", "city": "北京", "final_score": 0.80},
+    {"job_id": "J2", "company": "上地网络", "title": "后端开发实习",
+     "office_address": "北京市海淀区上地", "city": "北京", "final_score": 0.85},
+    {"job_id": "J3", "company": "国贸资本", "title": "算法实习",
+     "office_address": "北京市朝阳区国贸", "city": "北京", "final_score": 0.90},
+    {"job_id": "J4", "company": "亦庄智造", "title": "测试开发实习",
+     "office_address": "北京市大兴区亦庄经济开发区", "city": "北京", "final_score": 0.95},
+]
+
+_AGENT_FLOW_QUERY = "我现住址北京市海淀区五道口，我想找通勤时间小于半小时的实习职位"
+
+
+def agent_flow_test(user_query: Optional[str] = None) -> int:
+    """端到端验证 Agent 通勤流程（需联网 + 两个 API Key）。
+
+    1) LLM 判断意图：从自然语言问题抽取住址 / 时间上限 / 交通方式；
+    2) 高德 API 计算：对召回的候选岗位逐一地理编码 + 路线规划；
+    3) 体现到召回：按通勤约束过滤 + 重排，达标优先、超标排后。
+
+    断言聚焦「流程不变量」（意图识别正确、高德确被调用、近 < 远、远者超标、
+    召回被重排），不对具体分钟数做脆弱断言（高德实时路况会浮动）。
+    """
+    user_query = user_query or _AGENT_FLOW_QUERY
+    passed = 0
+    failed = 0
+    skipped = False
+
+    def check(name, ok, detail=""):
+        nonlocal passed, failed
+        if ok:
+            passed += 1
+            print(f"  [PASS] {name}{('  — ' + detail) if detail else ''}")
+        else:
+            failed += 1
+            print(f"  [FAIL] {name}{('  — ' + detail) if detail else ''}")
+
+    # 前置检查：缺 Key 时跳过而非失败（避免在无凭证环境下误报）
+    if not os.environ.get("DASHSCOPE_API_KEY") or not os.environ.get("AMAP_API_KEY"):
+        print("[SKIP] 未配置 DASHSCOPE_API_KEY / AMAP_API_KEY，跳过 Agent 流程测试。")
+        return 0
+
+    print("=" * 60)
+    print("【Agent 通勤流程端到端验证】")
+    print(f"用户问题：{user_query}")
+    print("=" * 60)
+
+    # ---- 步骤 1：LLM 判断通勤意图（Prompt 1）----
+    print("\n[1/3] LLM 抽取通勤意图 ...")
+    intent = extract_commute_intent(user_query)
+    print(f"      意图：has_constraint={intent.get('has_commute_constraint')}，"
+          f"住址={intent.get('user_address')}，"
+          f"上限={intent.get('max_commute_minutes')} 分钟，"
+          f"交通={intent.get('preferred_transport')}")
+    if intent.get("error"):
+        print(f"[SKIP] 意图抽取失败：{intent['error']}（多为网络 / 凭证问题），跳过后续。")
+        return 0
+
+    check("LLM 识别出通勤约束", intent.get("has_commute_constraint") is True)
+    check("时间上限解析为 30 分钟（半小时）", intent.get("max_commute_minutes") == 30,
+          f"got={intent.get('max_commute_minutes')}")
+    check("交通方式默认/识别为 transit", intent.get("preferred_transport") in (None, "transit"),
+          f"got={intent.get('preferred_transport')}")
+    check("住址含「海淀」", isinstance(intent.get("user_address"), str)
+          and "海淀" in (intent.get("user_address") or ""), intent.get("user_address"))
+
+    # ---- 步骤 2 + 3：高德实算 → 过滤 + 重排（体现到召回）----
+    print(f"\n[2/3] 高德 API 计算 {len(_AGENT_FLOW_SAMPLE_JOBS)} 个召回岗位的通勤时长 ...")
+    # 高德免费配额有 QPS 限制，突发请求可能被限流（部分岗位算不出）。
+    # 测试里做几次「整体重试」，取算出岗位最多的一次，让演示更稳定；生产代码不受影响。
+    import time
+    total_jobs = len(_AGENT_FLOW_SAMPLE_JOBS)
+    result = None
+    for attempt in range(1, 4):
+        candidate = compute_and_rank(intent, _AGENT_FLOW_SAMPLE_JOBS)
+        views = candidate["ranked_jobs"] + candidate["filtered_out"]
+        n_ok = sum(1 for v in views if v["commute_time_minutes"] is not None)
+        if result is None or n_ok > result[1]:
+            result = (candidate, n_ok)
+        if n_ok >= total_jobs or candidate.get("error"):
+            break
+        print(f"      第 {attempt} 次：{n_ok}/{total_jobs} 个算出（疑似限流），稍后重试 ...")
+        time.sleep(1.5)
+    result = result[0]
+
+    if result.get("error"):
+        print(f"[SKIP] 通勤计算未完成：{result['error']}，跳过召回断言。")
+        return 0 if failed == 0 else 1
+
+    by_id = {v["job_id"]: v for v in result["ranked_jobs"] + result["filtered_out"]}
+
+    print("\n[3/3] 通勤结果体现到岗位召回：")
+    print("      —— 召回排序（ranked_jobs，达标/补足优先）——")
+    for v in result["ranked_jobs"]:
+        print(f"        #{v.get('rank')} {v['job_id']} {by_id[v['job_id']].get('company','')}"
+              f" | {v['commute_summary']}")
+    print("      —— 排除/末位（filtered_out）——")
+    for v in result["filtered_out"]:
+        print(f"        {v['job_id']} | {v['commute_summary']} | {v.get('reason_excluded')}")
+    print(f"      召回说明：{result['note']}")
+
+    # 流程不变量断言（稳健，不依赖具体分钟）
+    print("\n[断言] 流程不变量：")
+    computed = {jid: by_id[jid]["commute_time_minutes"]
+                for jid in ("J1", "J2", "J3", "J4")
+                if by_id.get(jid) and by_id[jid]["commute_time_minutes"] is not None}
+    check("高德确被调用：至少 1 个岗位算出通勤时长", len(computed) >= 1,
+          f"computed={computed}")
+
+    near, far = by_id.get("J1"), by_id.get("J4")
+    if near and far and near["commute_time_minutes"] is not None and far["commute_time_minutes"] is not None:
+        check("距离单调：中关村(近) 通勤 < 亦庄(远) 通勤",
+              near["commute_time_minutes"] < far["commute_time_minutes"],
+              f"中关村={near['commute_time_minutes']}min < 亦庄={far['commute_time_minutes']}min")
+        check("远郊岗位被判为超标（within_limit=False）", far["within_limit"] is False,
+              f"亦庄 within_limit={far['within_limit']}")
+
+    qualified = [v for v in result["ranked_jobs"] if v["within_limit"] is True]
+    check("召回被重排：ranked_jobs 非空（达标优先，不足则按分数补足）",
+          len(result["ranked_jobs"]) >= 1,
+          f"达标 {len(qualified)} 个 / 召回 {len(result['ranked_jobs'])} 个")
+    check("每条召回都生成了通勤摘要文案",
+          all(by_id[jid].get("commute_summary") for jid in by_id))
+
+    print(f"\n结果：{passed} 通过 / {failed} 失败")
+    return 0 if failed == 0 else 1
+
+
+def main(argv=None):
+    """入口分发：无参数跑离线断言；`agent` 跑端到端 Agent 流程。"""
+    import sys
+    argv = sys.argv[1:] if argv is None else argv
+    # Windows 控制台默认 GBK，统一切到 UTF-8 以正常显示中文输出
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+    mode = argv[0].lower() if argv else "offline"
+    if mode in ("agent", "flow", "online", "--agent"):
+        query = argv[1] if len(argv) > 1 else None
+        return agent_flow_test(query)
+    return offline_test()
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(main())

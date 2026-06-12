@@ -4,11 +4,11 @@ pipeline.py
 端到端验收脚本（进前端前的统一回归测试）。
 
 覆盖 5 个核心场景：
-    S1  上传简历 + 直接 JD 评估（jd_evaluation 全流程）
-    S2  上传简历 + 岗位推荐（job_recommendation 全流程）
+    S1  上传简历 + 直接 JD 评估（jd_evaluation 全流程，含 FC planner 与 jd_ingest 入库）
+    S2  上传简历 + 岗位推荐（job_recommendation 全流程，混合检索）
     S3  JD 批量入库 + 检索（jd_ingest_node 去重 + 向量检索）
     S4  画像缓存命中（先上传保存画像，再不带简历命中缓存）
-    S5  Skill Gap / Learning Plan / Interview Questions 输出
+    S5  Skill Gap / Learning Plan(单次调用) / Interview Questions(3 题) 输出
 
 设计：
     - 每个场景独立 try/except，互不影响，最后汇总 PASS/FAIL；
@@ -30,7 +30,7 @@ try:
 except Exception:
     pass
 
-from state import get_initial_state
+from resume2job.agent.state import get_initial_state
 
 # ---------------------------------------------------------------------------
 # 验收常量与公共工具
@@ -65,11 +65,11 @@ def setup_env():
     shutil.rmtree(ACCEPT_DIR, ignore_errors=True)
     os.makedirs(ACCEPT_DIR, exist_ok=True)
 
-    import storage.profile_cache as pc
+    import resume2job.storage.profile_cache as pc
     pc.DB_PATH = os.path.join(ACCEPT_DIR, "resume2job.db")
     pc.init_db()
 
-    import storage.jd_ingest as jd
+    import resume2job.storage.jd_ingest as jd
     jd.DB_PATH = os.path.join(ACCEPT_DIR, "resume2job.db")
     jd.CHROMA_DIR = os.path.join(ACCEPT_DIR, "chroma_db")
     jd.init_db()
@@ -133,21 +133,15 @@ def scenario_3_jd_ingest_and_search(app, jd, ctx):
     """S3：JD 批量入库（含去重）+ 向量检索。"""
     name = "JD 批量入库 + 检索"
     try:
-        from jd_parser import parse_jd
+        from resume2job.parsing.jd_parser import parse_jd
 
         ingested, duplicates = [], 0
         first_job_id = None
+        first_parsed = None
         for idx, path in enumerate(JD_FILES):
             jd_text = _read_text(path)
             parsed = parse_jd(jd_text)
-            job_analysis = {
-                "company": parsed.get("company") or "",
-                "title": parsed.get("title") or "",
-                "city": (parsed.get("location") or {}).get("city") or "",
-                "required_skills": parsed.get("hard_skills") or [],
-                "responsibilities": parsed.get("responsibilities") or [],
-            }
-            out = jd.jd_ingest_node({"jd_raw_text": jd_text, "job_analysis": job_analysis, "errors": []})
+            out = jd.jd_ingest_node({"jd_text": jd_text, "jd_profiles": [parsed], "errors": []})
             _assert(bool(out.get("ingested_job_id")), f"{path} 入库未返回 job_id")
             if out.get("jd_is_duplicate"):
                 duplicates += 1
@@ -155,27 +149,28 @@ def scenario_3_jd_ingest_and_search(app, jd, ctx):
                 ingested.append(out["ingested_job_id"])
             if idx == 0:
                 first_job_id = out["ingested_job_id"]
+                first_parsed = parsed
 
         # 去重验证：重复提交第一条 JD 应被判为重复并复用同一 job_id
-        first_parsed = parse_jd(_read_text(JD_FILES[0]))
         dup_out = jd.jd_ingest_node({
-            "jd_raw_text": _read_text(JD_FILES[0]),
-            "job_analysis": {
-                "company": first_parsed.get("company") or "",
-                "title": first_parsed.get("title") or "",
-                "city": (first_parsed.get("location") or {}).get("city") or "",
-                "required_skills": first_parsed.get("hard_skills") or [],
-                "responsibilities": first_parsed.get("responsibilities") or [],
-            },
+            "jd_text": _read_text(JD_FILES[0]),
+            "jd_profiles": [first_parsed],
             "errors": [],
         })
         _assert(dup_out.get("jd_is_duplicate") is True, "重复提交未被判为重复")
         _assert(dup_out.get("ingested_job_id") == first_job_id, "重复 JD 未复用原 job_id")
 
         # 检索验证：在 jobs collection 中按语义检索，应有命中
-        res = jd._chroma_collection.query(query_texts=["大模型 Agent 算法工程师"], n_results=3)
+        from resume2job.core.llm import get_embedding
+        vec = get_embedding("大模型 Agent 算法工程师")
+        res = jd._chroma_collection.query(query_embeddings=[vec], n_results=3)
         hits = (res.get("ids") or [[]])[0]
         _assert(len(hits) >= 1, "向量检索无命中")
+
+        # 入库 metadata 应携带 jd_profile_json（用户粘贴入库的 JD 是检索一等公民）
+        sample = jd._chroma_collection.get(ids=[first_job_id], include=["metadatas"])
+        meta0 = (sample.get("metadatas") or [{}])[0] or {}
+        _assert(bool(meta0.get("jd_profile_json")), "入库 metadata 缺少 jd_profile_json")
 
         _record(3, name, True,
                 f"新入库 {len(ingested)} 条，去重命中 {duplicates}+1 条，检索 top{len(hits)} 命中")
@@ -239,7 +234,7 @@ def scenario_4_profile_cache_hit(app, pc, ctx):
 
 
 def scenario_5_gap_plan_interview(app, ctx):
-    """S5：Skill Gap / Learning Plan / Interview Questions 输出。"""
+    """S5：Skill Gap / Learning Plan（单次调用）/ Interview Questions（3 题）输出。"""
     name = "Skill Gap / Learning Plan / Interview Questions"
     try:
         # 复用 S1 的结果；若未跑 S1 则先补跑
@@ -257,13 +252,15 @@ def scenario_5_gap_plan_interview(app, ctx):
         _assert(isinstance(skill_gap, dict) and ("items" in skill_gap or "overall_risk" in skill_gap),
                 "skill_gap 结构异常")
 
-        # Learning Plan（由 learning_plan_node 在图内已生成）
-        plan = final.get("learning_plan") or {}
+        # Learning Plan（单次 LLM 调用生成全部阶段）
+        from resume2job.generation.learning_plan import build_learning_plan
+        plan = build_learning_plan(mr0, "给我一个 30 天每天 2 小时的学习计划")
         _assert(isinstance(plan, dict) and "overall_suggestion" in plan, "learning_plan 结构异常")
         n_stages = len(plan.get("stages") or [])
+        _assert(plan.get("error") is None, f"learning_plan error: {plan.get('error')}")
 
-        # Interview Questions + Answer Framework
-        from interview_preparer import generate_interview_questions, generate_answer_framework
+        # Interview Questions（固定 3 题）
+        from resume2job.generation.interview import generate_interview_questions, MAX_QUESTIONS
         q = generate_interview_questions(
             resume_profile=final.get("resume_profile") or {},
             jd_profile=mr0.get("jd_profile") or {},
@@ -271,22 +268,10 @@ def scenario_5_gap_plan_interview(app, ctx):
             skill_gap=skill_gap,
         )
         questions = q.get("questions") or []
-        _assert(len(questions) >= 1, "面试题生成为空")
-
-        af = generate_answer_framework(
-            question_item=questions[0],
-            resume_profile=final.get("resume_profile") or {},
-            jd_profile=mr0.get("jd_profile") or {},
-            match_result=mr0.get("match_score") or {},
-            skill_gap=skill_gap,
-        )
-        _assert(isinstance(af.get("answer_framework"), dict)
-                and len(af["answer_framework"].get("key_points") or []) >= 3,
-                "作答框架结构异常")
+        _assert(1 <= len(questions) <= MAX_QUESTIONS, f"面试题数量异常：{len(questions)}")
 
         _record(5, name, True,
-                f"learning_plan 阶段数={n_stages}, 面试题={len(questions)}, 作答框架 key_points="
-                f"{len(af['answer_framework']['key_points'])}")
+                f"learning_plan 阶段数={n_stages}, 面试题={len(questions)}（上限 {MAX_QUESTIONS}）")
     except Exception as e:
         _record(5, name, False, f"{type(e).__name__}: {e}")
 
@@ -310,7 +295,7 @@ def main(argv=None):
     print("=" * 64)
 
     pc, jd = setup_env()
-    from graph import build_graph
+    from resume2job.agent.graph import build_graph
     app = build_graph()
     ctx = {}
 

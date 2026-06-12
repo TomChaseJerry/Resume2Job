@@ -9,10 +9,10 @@ chat.py
 用户可以在一句话里自然地带上文件路径，例如：
     我的简历地址是 Resumes/resume_test_1.pdf，我想看看该 JD：JDs/jd_test_1.txt 适合我吗
 
-本入口会自动从输入中识别：
+本入口只负责从输入中识别文件路径：
     - *.pdf  -> 简历路径（pdf_path）
     - *.txt  -> JD 文件，读取其内容作为 jd_text
-    - 常见城市词 -> 检索城市过滤（city_filter）
+城市/方向/学历过滤与通勤约束由 Agent 的规划节点（Function Calling）从原话中抽取，
 其余文字作为用户问题交给 Agent 判断意图（评估 JD / 推荐岗位 / 技能差距）。
 
 默认只输出推荐/评估报告；只有当你的问题里出现「学习计划 / 学习路径」「面试题 / 模拟面试」
@@ -43,12 +43,8 @@ try:
 except Exception:
     pass
 
-from graph import build_graph, run_turn
-from storage import conversation_store
-
-# 常见城市词，用于从自然语言里粗提取检索城市过滤
-_CITIES = ["北京", "上海", "深圳", "广州", "杭州", "成都", "南京", "武汉",
-           "西安", "苏州", "天津", "重庆", "厦门", "合肥", "长沙"]
+from resume2job.agent.graph import build_graph, run_turn
+from resume2job.storage import conversation_store
 
 # 仅匹配真实路径字符（字母/数字/_ - . / \ :），让中文、引号、空格自然成为边界，
 # 避免把「我的简历地址是"Resumes/x.pdf"」整段误当成路径。
@@ -67,7 +63,10 @@ def _read_text(path: str) -> str:
 
 
 def extract_inputs(text: str):
-    """从一句用户输入中提取 (pdf_path, jd_text, city)。识别不到的返回 None。"""
+    """从一句用户输入中提取 (pdf_path, jd_text)。识别不到的返回 None。
+
+    城市等检索过滤条件不在此提取——由规划节点（Function Calling）从原话抽取。
+    """
     pdf_path = None
     m = _PDF_RE.search(text)
     if m and os.path.isfile(m.group(1)):
@@ -82,8 +81,7 @@ def extract_inputs(text: str):
     elif m:
         print(f"[提示] 识别到 JD 文件 {m.group(1)} 但文件不存在，已忽略。")
 
-    city = next((c for c in _CITIES if c in text), None)
-    return pdf_path, jd_text, city
+    return pdf_path, jd_text
 
 
 def _print_assistant(final_state: dict) -> None:
@@ -118,6 +116,18 @@ def _print_assistant(final_state: dict) -> None:
                 print(f"\n  ——「{(top.get('jd_profile') or {}).get('title', '首选岗位')}」详情——")
                 print("  " + report.replace("\n", "\n  "))
 
+    # 纯技能差距分析（skill_gap_only：无 match_results / 报告，仅 skill_gaps）
+    skill_gaps = final_state.get("skill_gaps") or []
+    if not match_results and skill_gaps:
+        from resume2job.generation.recommendation import format_skill_gap
+        for sg in skill_gaps:
+            head = " - ".join(x for x in (sg.get("company"), sg.get("title")) if x) \
+                or sg.get("job_id") or "目标岗位"
+            print(f"  ——对照「{head}」的能力差距分析——")
+            for ln in format_skill_gap(sg):
+                print(f"    - {ln}")
+            print()
+
     # 学习计划（若有）
     plan = final_state.get("learning_plan") or {}
     if plan.get("stages"):
@@ -143,18 +153,17 @@ def _print_assistant(final_state: dict) -> None:
         if interview.get("summary"):
             print(f"    小结：{interview['summary']}")
 
-    if not match_results and not final_response:
+    if not match_results and not final_response and not skill_gaps:
         print("  本轮没有生成岗位结果。可以试试：带上简历 PDF 路径，并说明想评估某个 JD 或推荐岗位。")
 
-    # 只展示对用户有意义的错误（结构化错误取其 error 文本）
+    # 只展示对用户有意义的错误
     errors = final_state.get("errors") or []
     cached = final_state.get("profile_source") == "cached"
     msgs = []
     for e in errors:
-        msg = e.get("error") if isinstance(e, dict) else str(e)
-        msg = str(msg)
-        # 命中缓存画像的轮次里，「缺少简历 PDF」类告警已被缓存覆盖，属噪音，不展示
-        if cached and ("pdf" in msg.lower() or "简历 PDF" in msg):
+        msg = str(e)
+        # 命中缓存画像的轮次里，「缺少简历」类告警已被缓存覆盖，属噪音，不展示
+        if cached and ("pdf" in msg.lower() or "简历" in msg):
             continue
         msgs.append(msg)
     if msgs:
@@ -264,7 +273,7 @@ def main() -> int:
             continue
 
         # ---- 普通消息：解析输入 + 执行一轮 ----
-        pdf_path, jd_text, city = extract_inputs(line)
+        pdf_path, jd_text = extract_inputs(line)
 
         try:
             final_state = run_turn(
@@ -273,7 +282,6 @@ def main() -> int:
                 session_id=session_id,
                 pdf_path=pdf_path,
                 jd_text=jd_text,
-                city_filter=city,
                 top_k=3,
             )
             _print_assistant(final_state)

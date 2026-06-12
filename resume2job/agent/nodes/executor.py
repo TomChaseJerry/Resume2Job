@@ -194,22 +194,25 @@ def job_retriever_node(state: AgentState) -> AgentState:
             education_filter=education_filter,
         )
         candidate_jobs = candidate_jobs or []
-        new_state["candidate_jobs"] = candidate_jobs
 
-        # 用户显式指定了城市，但召回结果无一命中该城市 -> 说明城市过滤被级联降级丢弃
-        # （知识库中没有该城市岗位）。必须明确告知用户，否则会把其它城市的岗位误当成
-        # 所求城市的结果（如「换成深圳的」却返回北京岗位）。
-        want_city = str(city_filter).strip() if city_filter else ""
-        if want_city and candidate_jobs and not any(
-            (j.get("city") or "").strip() == want_city for j in candidate_jobs
+        # 城市是用户显式硬约束：该城市召回为零（检索级联已保证绝不拿别的城市凑数）
+        # 时提前终止——清空候选、写 final_response 告知并询问是否放宽，下游评分节点
+        # 自然跳过，不对用户不要的城市浪费任何 LLM 评分调用。用户下一轮回复
+        # 「不限城市」即可走正常推荐（对话历史让 planner 能理解该追问）。
+        from resume2job.retrieval.retriever import normalize_city
+        want_city = normalize_city(city_filter)
+        if want_city and not any(
+            normalize_city(j.get("city")) == want_city for j in candidate_jobs
         ):
-            errors = list(new_state.get("errors") or [])
-            errors.append(
-                f"job_retriever_node: 知识库暂无「{want_city}」的岗位，以下为不限城市的匹配结果。"
+            new_state["candidate_jobs"] = []
+            new_state["final_response"] = (
+                f"知识库暂无「{want_city}」的实习岗位，本轮未做推荐。"
+                f"要不要看看不限城市的岗位？回复「不限城市」即可。"
             )
-            new_state["errors"] = errors
-            print(f"[job_retriever_node] 城市「{want_city}」无岗位，已降级为不限城市。")
+            print(f"[job_retriever_node] 城市「{want_city}」无岗位，提前终止推荐链路。")
+            return new_state
 
+        new_state["candidate_jobs"] = candidate_jobs
         print(f"[job_retriever_node] 召回候选岗位数量：{len(candidate_jobs)}")
     except Exception as exc:
         return append_error(state, f"job_retriever_node: 岗位检索异常：{exc}")
@@ -445,6 +448,9 @@ def match_scorer_node(state: AgentState) -> AgentState:
 
     jd_profiles = state.get("jd_profiles") or []
     if not jd_profiles:
+        # 上游已提前终止并给出用户可读说明（如城市硬约束无召回）：静默跳过，不再追加噪音错误
+        if state.get("final_response"):
+            return state
         return append_error(state, "match_scorer_node: 缺少 jd_profiles，无法评分")
 
     new_state = dict(state)

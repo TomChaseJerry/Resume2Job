@@ -15,7 +15,8 @@
 | 重排序 | gte-rerank 交叉编码器精排（召回-粗排-精排三段式） |
 | 自动化评测 | LLM 反向构造评测集；Recall@K / MRR / nDCG 四配置对比；LLM-as-judge 报告质量 |
 | 多轮记忆 | SQLite 用户画像缓存（跨轮免重传简历）+ 会话历史注入规划上下文 |
-| 知识库 | Chroma 向量库 + SQLite 元数据双存储；粘贴 JD 两层去重（哈希精确 + 语义近邻）自动入库 |
+| 存储分层 | SQLite 为事实源（全部业务数据），Chroma 只存向量 + 最小过滤标量；检索后按 job_id 回填（hydration），换 embedding 模型可从 SQLite 零成本重建索引 |
+| 知识库 | 粘贴 JD 两层去重（哈希精确 + 语义近邻）自动入库，与批量建库同一写入路径 |
 | 健壮性 | 所有 LLM 环节配确定性规则兜底；单点失败不阻断工作流（errors 透传） |
 
 ## 工作流
@@ -41,12 +42,13 @@ resume2job/
 ├── scoring/       match_scorer（技能/项目/学历/方向四维评分）、skill_gap
 ├── generation/    recommendation（推荐报告）、learning_plan（单次调用）、interview（3 题）
 ├── agent/         state、graph、nodes/（planner / executor / enhancements）
-├── storage/       paths、profile_cache、conversation_store、jd_ingest
+├── storage/       paths、jobs_store（jobs 表事实源）、profile_cache、conversation_store、jd_ingest
 ├── tools/         commute（高德路线规划）
 └── eval/          build_dataset、retrieval_eval、judge、run_eval
 chat.py            命令行多轮对话入口
 pipeline.py        5 场景端到端验收
-scripts/           ingest_jds（建库）、view_chroma / view_jds（只读巡检）、check_api
+scripts/           ingest_jds（建库）、rebuild_index（迁移/重建向量索引）、
+                   view_chroma / view_jds（只读巡检）、check_api
 ```
 
 ## 快速开始

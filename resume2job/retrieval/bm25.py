@@ -6,9 +6,13 @@
     - BM25 通道擅长精确关键词命中（「LangGraph」「RLHF」这类低频专有名词），
       不受 embedding 语义平滑稀释。
 
-语料直接来自 Chroma collection 的 documents（与向量通道共用同一份 index_text 与
-metadata），保证两个通道的可比性与过滤一致性。岗位库规模小（百级以内），
-每次检索时全量构建内存索引即可；构建结果按 collection 条数做轻量缓存。
+语料来自 SQLite 事实源（jobs 表的 index_text，与向量通道入库的是同一份文本），
+过滤字段（city / direction / education_level）也取自 SQLite，保证两个通道的
+可比性与过滤一致性；SQLite 无可用语料时回退到 Chroma documents（兼容未迁移的旧库）。
+岗位库规模小（百级以内），全量构建内存索引即可；按 jobs 表行数做轻量缓存。
+
+BM25 命中不携带 jd_profile —— 与向量通道一致，由 retriever 在融合后统一从
+SQLite 批量回填（hydration）。
 
 分词：jieba 搜索引擎模式（lcut_for_search），中英混排友好；统一小写。
 """
@@ -50,7 +54,7 @@ def _match_where(metadata: dict, where: Optional[dict]) -> bool:
 
 
 class BM25Corpus:
-    """基于 Chroma collection 全量 documents 构建的内存 BM25 索引。"""
+    """基于岗位库全量 index_text 构建的内存 BM25 索引。"""
 
     def __init__(self, ids: list, documents: list, metadatas: list):
         self.ids = ids
@@ -59,8 +63,22 @@ class BM25Corpus:
         self._bm25 = BM25Okapi([tokenize(doc) for doc in documents]) if documents else None
 
     @classmethod
+    def from_jobs_store(cls) -> "BM25Corpus":
+        """从 SQLite 事实源加载语料（首选路径）。"""
+        from resume2job.storage import jobs_store
+
+        rows = jobs_store.all_jobs_for_index()
+        ids = [r["job_id"] for r in rows]
+        documents = [r["index_text"] for r in rows]
+        metadatas = [
+            {k: v for k, v in r.items() if k not in ("job_id", "index_text") and v}
+            for r in rows
+        ]
+        return cls(ids, documents, metadatas)
+
+    @classmethod
     def from_collection(cls, collection) -> "BM25Corpus":
-        """从 Chroma collection 全量加载语料（与向量通道共用 index_text）。"""
+        """从 Chroma collection 加载语料（SQLite 未迁移时的兼容回退）。"""
         res = collection.get(include=["documents", "metadatas"])
         ids = res.get("ids") or []
         documents = res.get("documents") or []
@@ -100,45 +118,43 @@ class BM25Corpus:
                 "city": metadata.get("city"),
                 "retrieval_score": norm,
                 "bm25_score": norm,
-                "matched_terms": [],   # 由调用方统一用 extract_matched_terms 填充
+                "matched_terms": [],   # 由 retriever 在回填后统一填充
                 "document": self.documents[i] or "",
                 "metadata": metadata,
-                "jd_profile": _load_jd_profile(metadata),
+                "jd_profile": {},      # 由 retriever 从 SQLite 统一回填
             })
             if len(hits) >= max(1, n_results):
                 break
         return hits
 
 
-def _load_jd_profile(metadata: dict) -> dict:
-    """从 metadata.jd_profile_json 还原结构化 JD（失败返回空字典）。"""
-    import json
-
-    raw = (metadata or {}).get("jd_profile_json")
-    if isinstance(raw, str) and raw.strip():
-        try:
-            loaded = json.loads(raw)
-            if isinstance(loaded, dict):
-                return loaded
-        except json.JSONDecodeError:
-            pass
-    return {}
-
-
-# ===== 轻量缓存：同一 collection 条数不变时复用已建索引 =====
+# ===== 轻量缓存：岗位库条数不变时复用已建索引 =====
 _CACHE: dict = {}
 
 
-def get_bm25_corpus(collection) -> BM25Corpus:
-    """获取（必要时构建）BM25 索引；以 collection 名 + 条数为缓存键。
+def get_bm25_corpus(collection=None) -> BM25Corpus:
+    """获取（必要时构建）BM25 索引；以来源 + 条数为缓存键。
 
-    岗位库追加新 JD 后 count 变化，自动触发重建；百级语料重建开销可忽略。
+    首选 SQLite 事实源；其 index_text 为空（旧库未迁移）且提供了 collection 时
+    回退到 Chroma documents。岗位库追加新 JD 后条数变化，自动触发重建；
+    百级语料重建开销可忽略。
     """
-    try:
-        key = (collection.name, collection.count())
-    except Exception:
-        return BM25Corpus.from_collection(collection)
+    from resume2job.storage import jobs_store
+
+    n = jobs_store.count()
+    key = ("sqlite", jobs_store.DB_PATH, n)
     if key not in _CACHE:
+        corpus = BM25Corpus.from_jobs_store()
+        if not corpus.ids and collection is not None:
+            print("[WARN] SQLite 无可用 BM25 语料（未迁移？），回退 Chroma documents。"
+                  "建议运行 scripts/rebuild_index.py --migrate")
+            try:
+                key = ("chroma", collection.name, collection.count())
+            except Exception:
+                return BM25Corpus.from_collection(collection)
+            if key in _CACHE:
+                return _CACHE[key]
+            corpus = BM25Corpus.from_collection(collection)
         _CACHE.clear()  # 只保留当前版本，避免陈旧索引堆积
-        _CACHE[key] = BM25Corpus.from_collection(collection)
+        _CACHE[key] = corpus
     return _CACHE[key]

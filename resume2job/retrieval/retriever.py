@@ -54,6 +54,8 @@ from resume2job.core import config
 from resume2job.retrieval.bm25 import get_bm25_corpus
 from resume2job.retrieval.fusion import rrf_fuse
 from resume2job.retrieval.rerank import rerank_hits
+# SQLite 事实源：检索通道只回 job_id + 分数，业务数据在此批量回填（hydration）
+from resume2job.storage import jobs_store
 
 
 # ===== 模型 / 接口常量 =====
@@ -406,6 +408,16 @@ def _format_queries(queries: dict) -> str:
 
 
 # ===== Step 2：metadata 过滤条件构造 =====
+def normalize_city(city) -> str:
+    """城市值规范化：去空白并去掉「市」后缀，与库内存储值（如「北京」）对齐。
+
+    通勤住址提取出的城市常带「市」（「北京市海淀区…」→「北京市」），
+    而 jd_profile.location.city 存的是「北京」，不规范化会导致硬约束误判无召回。
+    """
+    s = str(city).strip() if city else ""
+    return s[:-1] if s.endswith("市") and len(s) > 2 else s
+
+
 def build_where_filter(city_filter: Optional[str],
                        direction_filter: Optional[str],
                        education_filter: Optional[str]) -> Optional[dict]:
@@ -415,8 +427,8 @@ def build_where_filter(city_filter: Optional[str],
     - 无任何条件返回 None（表示不传 where）。
     """
     conditions = []
-    if city_filter and str(city_filter).strip():
-        conditions.append({"city": str(city_filter).strip()})
+    if normalize_city(city_filter):
+        conditions.append({"city": normalize_city(city_filter)})
     if direction_filter and str(direction_filter).strip():
         conditions.append({"direction": str(direction_filter).strip()})
     if education_filter and str(education_filter).strip():
@@ -444,19 +456,25 @@ def _describe_filter(city: Optional[str], direction: Optional[str], education: O
 def _build_filter_cascade(city_filter: Optional[str],
                           direction_filter: Optional[str],
                           education_filter: Optional[str]) -> list:
-    """构造降级重试的过滤级联（从严到松）：
+    """构造降级重试的过滤级联（从严到松）。
 
-    1. 全部过滤（city + direction + education）；
-    2. 去掉 direction（方向表述差异大，最容易导致空召回）；
-    3. 完全不过滤。
+    硬约束 / 软约束的区分：
+        - 城市是用户显式给出的客观硬约束——「深圳」没有岗位就是没有，
+          绝不允许降级丢弃后拿别的城市凑数（召回为零由上游节点提前终止并告知用户）；
+        - 方向 / 学历是表述差异大的软约束（「大模型」vs「LLM 算法」），
+          降级后语义检索仍能保住相关性，允许逐级放宽。
 
+    级联顺序：全过滤 → 去方向 → 去学历（城市始终保留）；
+    仅当用户未指定城市时，才允许最终降到完全不过滤。
     仅保留彼此不同的级别，避免重复检索。每级返回 (desc, where, effective_tuple)。
     """
     levels = [
         (city_filter, direction_filter, education_filter),
-        (city_filter, None, education_filter),  # 去方向
-        (None, None, None),                      # 不过滤
+        (city_filter, None, education_filter),  # 去方向（最易导致空召回）
+        (city_filter, None, None),              # 再去学历，城市硬约束保留
     ]
+    if not (city_filter and str(city_filter).strip()):
+        levels.append((None, None, None))       # 未指定城市时才允许完全不过滤
     cascade, seen = [], []
     for city, direction, education in levels:
         where = build_where_filter(city, direction, education)
@@ -606,17 +624,6 @@ def _normalize_query_result(res: dict, query_text: str) -> list:
         distance = distances[i] if i < len(distances) else None
         score = _distance_to_score(distance)  # 无 distance -> 0.0，但不崩溃
 
-        # 还原 jd_profile（jd_profile_json 解析失败则空字典）
-        jd_profile = {}
-        raw_profile = metadata.get("jd_profile_json")
-        if isinstance(raw_profile, str) and raw_profile.strip():
-            try:
-                loaded = json.loads(raw_profile)
-                if isinstance(loaded, dict):
-                    jd_profile = loaded
-            except json.JSONDecodeError:
-                jd_profile = {}
-
         hits.append({
             "job_id": job_id,
             "company": metadata.get("company"),
@@ -625,32 +632,57 @@ def _normalize_query_result(res: dict, query_text: str) -> list:
             "city": metadata.get("city"),
             "retrieval_score": score,
             "vector_score": score,
-            "matched_terms": extract_matched_terms(query_text, document, metadata, jd_profile),
+            "matched_terms": [],   # 回填后由 _finalize_hits 统一填充
             "document": document or "",
             "metadata": metadata,
-            "jd_profile": jd_profile,
+            "jd_profile": {},      # 由 _hydrate_hits 从 SQLite 事实源回填
         })
     return hits
 
 
-def _bm25_query_once(corpus, query_text: str, where: Optional[dict], n_results: int) -> list:
-    """对单个 Query 执行一次 BM25 检索，并补齐 matched_terms 解释。
+def _hydrate_hits(hits: list) -> None:
+    """检索命中回填（hydration）：从 SQLite 事实源批量取回业务数据。
 
-    任意异常只打印并返回 []，与向量通道的容错约定一致。
+    Chroma / BM25 通道只携带最小过滤字段；jd_profile 与权威的
+    company/title/city/direction 在此一次性 IN 查询补齐。
+    事实源缺失某 job_id 时（异常情况）保留通道返回的字段，不报错。
     """
-    if not query_text or not query_text.strip():
-        return []
-    try:
-        hits = corpus.search(query_text, n_results, where)
-    except Exception as e:
-        print(f"[ERROR] BM25 检索失败：{e}")
-        return []
+    rows = jobs_store.get_jobs_by_ids([h.get("job_id") for h in hits])
+    for hit in hits:
+        row = rows.get(hit.get("job_id"))
+        if not row:
+            continue
+        hit["jd_profile"] = row.get("jd_profile") or {}
+        for key in ("company", "title", "city", "direction"):
+            if row.get(key):
+                hit[key] = row[key]
+
+
+def _finalize_hits(hits: list, query_text: str) -> list:
+    """单通道命中的统一收尾：SQLite 回填 + matched_terms 解释。"""
+    if not hits:
+        return hits
+    _hydrate_hits(hits)
     for hit in hits:
         hit["matched_terms"] = extract_matched_terms(
             query_text, hit.get("document") or "", hit.get("metadata") or {},
             hit.get("jd_profile") or {},
         )
     return hits
+
+
+def _bm25_query_once(corpus, query_text: str, where: Optional[dict], n_results: int) -> list:
+    """对单个 Query 执行一次 BM25 检索（回填与 matched_terms 由 _finalize_hits 统一处理）。
+
+    任意异常只打印并返回 []，与向量通道的容错约定一致。
+    """
+    if not query_text or not query_text.strip():
+        return []
+    try:
+        return corpus.search(query_text, n_results, where)
+    except Exception as e:
+        print(f"[ERROR] BM25 检索失败：{e}")
+        return []
 
 
 def _build_rerank_query(queries: dict) -> str:
@@ -696,13 +728,14 @@ def search_jobs(
 
     ranked_lists = []
     if mode in ("vector", "hybrid"):
-        hits = _query_once(collection, query_text, None, top_k * 2)
+        hits = _finalize_hits(_query_once(collection, query_text, None, top_k * 2), query_text)
         if hits:
             ranked_lists.append(hits)
     if mode in ("bm25", "hybrid"):
         try:
             corpus = get_bm25_corpus(collection)
-            hits = _bm25_query_once(corpus, query_text, None, top_k * 2)
+            hits = _finalize_hits(
+                _bm25_query_once(corpus, query_text, None, top_k * 2), query_text)
             if hits:
                 ranked_lists.append(hits)
         except Exception as e:
@@ -811,12 +844,12 @@ def retrieve_jobs(
                 continue
             print(f"[INFO] 执行检索：{qkey} -> {query_text}")
             if use_vector:
-                hits = _query_once(collection, query_text, where, per_query_k)
+                hits = _finalize_hits(_query_once(collection, query_text, where, per_query_k), query_text)
                 print(f"[INFO]   向量通道返回：{len(hits)} 条")
                 if hits:
                     ranked_lists.append(hits)
             if use_bm25:
-                hits = _bm25_query_once(bm25_corpus, query_text, where, per_query_k)
+                hits = _finalize_hits(_bm25_query_once(bm25_corpus, query_text, where, per_query_k), query_text)
                 print(f"[INFO]   BM25 通道返回：{len(hits)} 条")
                 if hits:
                     ranked_lists.append(hits)

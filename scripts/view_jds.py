@@ -4,8 +4,8 @@ view_jds.py
 汇总 JDs 文件夹下所有岗位的关键信息（只读，不调用 LLM）。
 
 数据来源不是重新解析 .txt，而是直接复用入库时已解析好的结构化画像：
-批量入库（ingest_jds.py / job_indexer.py）会把每个 JD 的完整 jd_profile
-以 jd_profile_json 形式存进向量库 metadata，且 job_id = 文件名去扩展名。
+批量入库（scripts/ingest_jds.py）会把每个 JD 的完整 jd_profile 以
+jd_profile_json 形式存进 SQLite jobs 表（事实源），且 job_id = 文件名去扩展名。
 本脚本据此把每个 JD 文件映射回其已解析画像，零 token 汇总关键字段。
 
 用法：
@@ -21,13 +21,9 @@ import sys
 import json
 import argparse
 
-import chromadb
-
 # 脚本位于 scripts/ 下，手动把项目根目录加进 sys.path 以便导入 resume2job 包
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _PROJECT_ROOT)
-
-from resume2job.storage.paths import CHROMA_DIR, COLLECTION_NAME
 
 # Windows 控制台中文输出
 try:
@@ -38,36 +34,18 @@ except Exception:
 DEFAULT_JD_FOLDER = os.path.join(_PROJECT_ROOT, "JDs")
 
 
-def _open_collection():
-    """打开统一向量库的 jobs collection；目录不存在时返回 None。"""
-    if not os.path.isdir(CHROMA_DIR):
-        print(f"[ERROR] 向量库目录不存在：{CHROMA_DIR}")
-        print("       先运行 python ingest_jds.py 入库。")
-        return None
-    client = chromadb.PersistentClient(path=CHROMA_DIR)
-    return client.get_or_create_collection(name=COLLECTION_NAME)
+def _load_profiles_by_job_id() -> dict:
+    """从 SQLite 事实源构建 {job_id: jd_profile(dict)} 映射。
 
-
-def _load_profiles_by_job_id(collection) -> dict:
-    """一次性读出全部记录，构建 {job_id: jd_profile(dict)} 映射。
-
-    jd_profile 取自 metadata 的 jd_profile_json（入库时已解析），解析失败的条目跳过。
+    画像存于 jobs 表的 jd_profile_json（入库时已解析），画像为空的条目跳过。
     """
-    res = collection.get(include=["metadatas"])
-    ids = res.get("ids") or []
-    metas = res.get("metadatas") or []
+    from resume2job.storage import jobs_store
+
     mapping = {}
-    for i, job_id in enumerate(ids):
-        meta = metas[i] if i < len(metas) else {}
-        raw = (meta or {}).get("jd_profile_json")
-        if not raw:
-            continue
-        try:
-            profile = json.loads(raw)
-            if isinstance(profile, dict):
-                mapping[job_id] = profile
-        except (json.JSONDecodeError, TypeError):
-            continue
+    for row in jobs_store.all_jobs_for_index():
+        full = jobs_store.get_job(row["job_id"])
+        if full and full.get("jd_profile"):
+            mapping[row["job_id"]] = full["jd_profile"]
     return mapping
 
 
@@ -135,19 +113,17 @@ def main() -> int:
         print(f"[ERROR] JD 文件夹不存在：{jd_folder}")
         return 1
 
-    collection = _open_collection()
-    if collection is None:
-        return 1
+    from resume2job.storage import jobs_store
 
-    profiles = _load_profiles_by_job_id(collection)
+    profiles = _load_profiles_by_job_id()
 
     # 按文件名排序，保证输出稳定
     txt_files = sorted(f for f in os.listdir(jd_folder) if f.lower().endswith(".txt"))
 
     print("=" * 60)
     print(f"JD 文件夹：{jd_folder}")
-    print(f"向量库：{CHROMA_DIR}（collection={COLLECTION_NAME}）")
-    print(f"JD 文件数：{len(txt_files)}    向量库已解析画像数：{len(profiles)}")
+    print(f"事实源：{jobs_store.DB_PATH}（jobs 表）")
+    print(f"JD 文件数：{len(txt_files)}    已解析画像数：{len(profiles)}")
     print("=" * 60)
 
     if not txt_files:
@@ -167,7 +143,7 @@ def main() -> int:
 
     print(f"\n——汇总：{matched}/{len(txt_files)} 个 JD 已入库并展示——")
     if missing:
-        print(f"未入库（向量库中无对应 job_id，请先 python ingest_jds.py）：")
+        print(f"未入库（jobs 表中无对应画像，请先 python scripts/ingest_jds.py）：")
         for f in missing:
             print(f"  - {f}")
 

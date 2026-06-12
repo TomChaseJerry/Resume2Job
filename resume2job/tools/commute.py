@@ -230,9 +230,50 @@ def _parse_duration_seconds(data: Optional[dict], base: str) -> Optional[int]:
     return None
 
 
-def amap_route_minutes(origin: str, destination: str, transport: str,
-                       city: Optional[str], api_key: str) -> Optional[int]:
-    """调用高德路线规划，返回通勤分钟数（四舍五入）；失败返回 None。"""
+def _parse_route_desc(data: Optional[dict], base: str) -> str:
+    """从高德路线规划响应中提取人类可读的路线描述。
+
+    公交/地铁：换乘线路串（如「地铁10号线 → 地铁4号线」，取首方案、最多 5 段）；
+    驾车/步行/骑行：全程公里数。解析失败返回空串（摘要中省略路线部分）。
+    """
+    if not isinstance(data, dict):
+        return ""
+    try:
+        if base == AMAP_V4:  # 骑行 v4
+            paths = (data.get("data") or {}).get("paths") or []
+            if paths and paths[0].get("distance"):
+                return f"全程约 {int(paths[0]['distance']) / 1000:.1f} 公里"
+            return ""
+        route = data.get("route") or {}
+        if "transits" in route:  # 公交/地铁
+            transits = route.get("transits") or []
+            if not transits:
+                return ""
+            legs = []
+            for seg in transits[0].get("segments") or []:
+                bus = seg.get("bus") or {}
+                for line in bus.get("buslines") or []:
+                    # 线路名形如「地铁10号线(巴沟--火器营)」，去掉括号内的方向描述
+                    name = str(line.get("name") or "").split("(")[0].strip()
+                    if name and name not in legs:
+                        legs.append(name)
+                railway = seg.get("railway") or {}
+                if isinstance(railway, dict) and railway.get("name"):
+                    name = str(railway["name"]).split("(")[0].strip()
+                    if name and name not in legs:
+                        legs.append(name)
+            return " → ".join(legs[:5])
+        paths = route.get("paths") or []  # 驾车 / 步行
+        if paths and paths[0].get("distance"):
+            return f"全程约 {int(paths[0]['distance']) / 1000:.1f} 公里"
+    except (ValueError, TypeError, AttributeError):
+        return ""
+    return ""
+
+
+def amap_route(origin: str, destination: str, transport: str,
+               city: Optional[str], api_key: str) -> "tuple[Optional[int], str]":
+    """调用高德路线规划，返回 (通勤分钟数, 路线描述)；失败返回 (None, "")。"""
     base, path = TRANSPORT_ENDPOINT.get(transport, TRANSPORT_ENDPOINT[DEFAULT_TRANSPORT])
     params = {"key": api_key, "origin": origin, "destination": destination}
     if transport == "transit":
@@ -242,8 +283,8 @@ def amap_route_minutes(origin: str, destination: str, transport: str,
     data = _http_get_json(base, path, params)
     seconds = _parse_duration_seconds(data, base)
     if seconds is None:
-        return None
-    return max(0, round(seconds / 60))
+        return None, ""
+    return max(0, round(seconds / 60)), _parse_route_desc(data, base)
 
 
 # ===== 通勤摘要文案（Python 模板，替代 Prompt 3 的自然语言生成）=====
@@ -251,18 +292,20 @@ _TRANSPORT_CN = {"transit": "地铁/公交", "driving": "驾车", "walking": "�
 
 
 def _commute_summary(minutes: Optional[int], within: Optional[bool],
-                     transport: str, limit: Optional[int], addr_known: bool) -> str:
-    """生成面向用户的通勤说明，不暴露 API 字段名。"""
+                     transport: str, limit: Optional[int], addr_known: bool,
+                     route: str = "") -> str:
+    """生成面向用户的通勤说明（时长 + 路线），不暴露 API 字段名。"""
     mode_cn = _TRANSPORT_CN.get(transport, "地铁/公交")
     if not addr_known:
         return "办公地址未知，无法计算通勤"
     if minutes is None:
         return f"{mode_cn}路线无法计算"
+    route_part = f"（路线：{route}）" if route else ""
     if within:
-        return f"{mode_cn}约 {minutes} 分钟，符合通勤要求"
+        return f"{mode_cn}约 {minutes} 分钟{route_part}，符合通勤要求"
     if limit:
-        return f"{mode_cn}约 {minutes} 分钟，超出你设定的 {limit} 分钟上限"
-    return f"{mode_cn}约 {minutes} 分钟"
+        return f"{mode_cn}约 {minutes} 分钟{route_part}，超出你设定的 {limit} 分钟上限"
+    return f"{mode_cn}约 {minutes} 分钟{route_part}"
 
 
 # ===== Prompt 3 等价逻辑：过滤与排序（Python）=====
@@ -316,8 +359,10 @@ def _rank_jobs(records: list, max_minutes: Optional[int], transport: str) -> dic
             "company": r.get("company"),
             "title": r.get("title"),
             "commute_time_minutes": minutes,
+            "commute_route": r.get("commute_route") or "",
             "within_limit": within_limit,
-            "commute_summary": _commute_summary(minutes, within_limit, transport, max_minutes, bool(addr_known)),
+            "commute_summary": _commute_summary(minutes, within_limit, transport, max_minutes,
+                                                bool(addr_known), route=r.get("commute_route") or ""),
             "final_score": r.get("final_score"),
         }
         if rank is not None:
@@ -383,12 +428,13 @@ def compute_and_rank(intent: dict, jobs: list) -> dict:
         office = job.get("office_address")
         job_city = job.get("city") or extract_city(office)
         minutes = None
+        route = ""
         addr_known = bool(office)
 
         if origin and api_key and addr_known:
             dest = amap_geocode(office, job_city, api_key, geocode_cache)
             if dest:
-                minutes = amap_route_minutes(origin, dest, transport, job_city, api_key)
+                minutes, route = amap_route(origin, dest, transport, job_city, api_key)
             else:
                 addr_known = False  # 目的地无法编码，等同地址不可用
 
@@ -398,6 +444,7 @@ def compute_and_rank(intent: dict, jobs: list) -> dict:
             "title": job.get("title"),
             "final_score": job.get("final_score"),
             "commute_minutes": minutes,
+            "commute_route": route,
             "addr_known": addr_known,
         })
 
@@ -408,6 +455,7 @@ def compute_and_rank(intent: dict, jobs: list) -> dict:
     for v in ranked["ranked_jobs"] + ranked["filtered_out"]:
         per_job[v["job_id"]] = {
             "commute_time_minutes": v["commute_time_minutes"],
+            "commute_route": v.get("commute_route") or "",
             "within_limit": v["within_limit"],
             "commute_summary": v["commute_summary"],
             "transport": transport,

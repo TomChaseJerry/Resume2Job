@@ -199,11 +199,11 @@ def job_retriever_node(state: AgentState) -> AgentState:
         # 时提前终止——清空候选、写 final_response 告知并询问是否放宽，下游评分节点
         # 自然跳过，不对用户不要的城市浪费任何 LLM 评分调用。用户下一轮回复
         # 「不限城市」即可走正常推荐（对话历史让 planner 能理解该追问）。
-        from resume2job.retrieval.retriever import normalize_city
+        # 城市硬约束已在 retrieve_jobs 内做 post-filter（基于多城市 cities）：
+        # 指定了城市却召回为空，即知识库无该城市岗位 -> 提前终止，避免浪费评分调用。
+        from resume2job.parsing.jd_parser import normalize_city
         want_city = normalize_city(city_filter)
-        if want_city and not any(
-            normalize_city(j.get("city")) == want_city for j in candidate_jobs
-        ):
+        if want_city and not candidate_jobs:
             new_state["candidate_jobs"] = []
             new_state["final_response"] = (
                 f"知识库暂无「{want_city}」的实习岗位，本轮未做推荐。"

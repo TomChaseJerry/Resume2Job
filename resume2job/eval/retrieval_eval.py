@@ -7,10 +7,11 @@
     hybrid          双通道 + RRF 融合
     hybrid+rerank   融合后再 gte-rerank 精排
 
-指标定义（gold 为评测集的 relevant_job_ids）：
-    Recall@K  ：Top-K 内命中的 gold 占全部 gold 的比例，对 query 取宏平均；
+指标定义（gold 为评测集的 relevant_job_ids，对 query 取宏平均）：
+    Hit@1     ：首位是否命中任一 gold（命中 1，否则 0）；多 gold 下比 Recall@1 直观；
+    Recall@5  ：Top-5 内命中的 gold 占全部 gold 的比例；
     MRR@10    ：第一个 gold 命中名次的倒数（1/rank），未命中记 0；
-    nDCG@K    ：DCG@K / IDCG@K，二值相关性（gold=1，其余=0）。
+    nDCG@5    ：DCG@5 / IDCG@5，二值相关性（gold=1，其余=0）。
 
 用法：
     python -m resume2job.eval.retrieval_eval [--top_k 5] [--modes vector bm25 hybrid hybrid+rerank]
@@ -39,6 +40,17 @@ CONFIGS = {
 # ---------------------------------------------------------------------------
 # 指标计算
 # ---------------------------------------------------------------------------
+def hit_at_k(ranked_ids: list, gold: set, k: int) -> float:
+    """Hit@K：前 K 命中任一相关岗位即记 1，否则 0。
+
+    多 gold 场景下比 Recall@1 更直观——Recall@1 上限是 1/|gold|（平均 4 个相关时
+    天花板仅 0.25），而「首位是否命中」用命中率（0/1）表达更贴合「第一条准不准」。
+    """
+    if not gold:
+        return 0.0
+    return 1.0 if set(ranked_ids[:k]) & gold else 0.0
+
+
 def recall_at_k(ranked_ids: list, gold: set, k: int) -> float:
     if not gold:
         return 0.0
@@ -66,14 +78,14 @@ def ndcg_at_k(ranked_ids: list, gold: set, k: int) -> float:
 # ---------------------------------------------------------------------------
 def evaluate_config(samples: list, mode: str, use_rerank: bool, top_k: int) -> dict:
     """对一个检索配置跑全量评测集，返回宏平均指标。"""
-    metrics = {"recall@1": [], f"recall@{top_k}": [], "mrr@10": [],
+    metrics = {"hit@1": [], f"recall@{top_k}": [], "mrr@10": [],
                f"ndcg@{top_k}": []}
     for sample in samples:
         gold = set(sample["relevant_job_ids"])
         hits = search_jobs(sample["query"], top_k=max(top_k, 10),
                            mode=mode, use_rerank=use_rerank)
         ranked_ids = [h.get("job_id") for h in hits]
-        metrics["recall@1"].append(recall_at_k(ranked_ids, gold, 1))
+        metrics["hit@1"].append(hit_at_k(ranked_ids, gold, 1))
         metrics[f"recall@{top_k}"].append(recall_at_k(ranked_ids, gold, top_k))
         metrics["mrr@10"].append(mrr_at_k(ranked_ids, gold, 10))
         metrics[f"ndcg@{top_k}"].append(ndcg_at_k(ranked_ids, gold, top_k))

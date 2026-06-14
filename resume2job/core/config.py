@@ -40,7 +40,7 @@ DASHSCOPE_NATIVE_URL = _env(
 # ===== 主对话 / 生成模型 =====
 # 用于：简历解析、JD 解析、推荐写作、技能差距、学习计划、面试准备、
 #       匹配打分主模型、检索 query 改写等需要较强推理的场景。
-CHAT_MODEL = _env("RESUME2JOB_CHAT_MODEL", "qwen3.7-max")
+CHAT_MODEL = _env("RESUME2JOB_CHAT_MODEL", "deepseek-v4-pro")
 
 # ===== 轻量模型 =====
 # 规划（task_type + 检索过滤 + 通勤意图的 Function Calling 结构化输出）：输出短、规则明确。
@@ -48,14 +48,14 @@ PLANNER_MODEL = _env("RESUME2JOB_PLANNER_MODEL", "qwen-flash")
 # 评分（project/direction）：rubric 明确、输出仅 score + evidence。
 SCORE_MODEL = _env("RESUME2JOB_SCORE_MODEL", "qwen-plus")
 # 评测 LLM-as-judge：与被评模型区分，避免自评偏置时可单独切换。
-JUDGE_MODEL = _env("RESUME2JOB_JUDGE_MODEL", "qwen-plus")
+JUDGE_MODEL = _env("RESUME2JOB_JUDGE_MODEL", "glm-5")
 
 # ===== Embedding 模型 =====
 # 注意：更换 Embedding 模型通常会改变向量维度，需重建 Chroma 向量库后才能检索一致。
 EMBEDDING_MODEL = _env("RESUME2JOB_EMBEDDING_MODEL", "text-embedding-v3")
 
 # ===== Rerank 模型（DashScope 原生 text-rerank 接口）=====
-RERANK_MODEL = _env("RESUME2JOB_RERANK_MODEL", "gte-rerank-v2")
+RERANK_MODEL = _env("RESUME2JOB_RERANK_MODEL", "qwen3-rerank")
 
 # ===== 检索策略 =====
 # 检索模式：vector（纯向量）/ bm25（纯关键词）/ hybrid（RRF 融合，默认）

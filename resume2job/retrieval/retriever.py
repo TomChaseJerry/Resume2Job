@@ -408,27 +408,20 @@ def _format_queries(queries: dict) -> str:
 
 
 # ===== Step 2：metadata 过滤条件构造 =====
-def normalize_city(city) -> str:
-    """城市值规范化：去空白并去掉「市」后缀，与库内存储值（如「北京」）对齐。
-
-    通勤住址提取出的城市常带「市」（「北京市海淀区…」→「北京市」），
-    而 jd_profile.location.city 存的是「北京」，不规范化会导致硬约束误判无召回。
-    """
-    s = str(city).strip() if city else ""
-    return s[:-1] if s.endswith("市") and len(s) > 2 else s
-
-
 def build_where_filter(city_filter: Optional[str],
                        direction_filter: Optional[str],
                        education_filter: Optional[str]) -> Optional[dict]:
-    """构造符合 ChromaDB 语法的 where 过滤条件。
+    """构造符合 ChromaDB 语法的 where 过滤条件（不含城市）。
+
+    城市不在此处过滤：岗位可能有多个工作城市，而 Chroma metadata 的 city 是
+    单值标量、where 等值匹配无法表达「用户城市 ∈ 岗位多城市」，会漏召回多城市岗位。
+    因此城市改为检索回填后用 jd_profile.location.cities 做 Python post-filter
+    （见 retrieve_jobs 的 _city_match）。此处只处理方向 / 学历。
 
     - 单条件直接 {field: value}；多条件用 {"$and": [...]}；
     - 无任何条件返回 None（表示不传 where）。
     """
     conditions = []
-    if normalize_city(city_filter):
-        conditions.append({"city": normalize_city(city_filter)})
     if direction_filter and str(direction_filter).strip():
         conditions.append({"direction": str(direction_filter).strip()})
     if education_filter and str(education_filter).strip():
@@ -441,11 +434,9 @@ def build_where_filter(city_filter: Optional[str],
     return {"$and": conditions}
 
 
-def _describe_filter(city: Optional[str], direction: Optional[str], education: Optional[str]) -> str:
-    """生成人类可读的过滤级别描述，无任何条件时返回「无过滤」。"""
+def _describe_filter(direction: Optional[str], education: Optional[str]) -> str:
+    """生成人类可读的 where 过滤级别描述（不含城市），无条件时返回「无过滤」。"""
     parts = []
-    if city and str(city).strip():
-        parts.append(f"city={str(city).strip()}")
     if direction and str(direction).strip():
         parts.append(f"direction={str(direction).strip()}")
     if education and str(education).strip():
@@ -453,38 +444,45 @@ def _describe_filter(city: Optional[str], direction: Optional[str], education: O
     return ", ".join(parts) if parts else "无过滤"
 
 
-def _build_filter_cascade(city_filter: Optional[str],
-                          direction_filter: Optional[str],
+def _build_filter_cascade(direction_filter: Optional[str],
                           education_filter: Optional[str]) -> list:
-    """构造降级重试的过滤级联（从严到松）。
+    """构造 where 过滤的降级级联（从严到松，仅方向 / 学历）。
 
-    硬约束 / 软约束的区分：
-        - 城市是用户显式给出的客观硬约束——「深圳」没有岗位就是没有，
-          绝不允许降级丢弃后拿别的城市凑数（召回为零由上游节点提前终止并告知用户）；
-        - 方向 / 学历是表述差异大的软约束（「大模型」vs「LLM 算法」），
-          降级后语义检索仍能保住相关性，允许逐级放宽。
+    城市不在 where 内（多城市岗位无法用单值等值表达），改为检索后用
+    jd_profile.location.cities 做硬约束 post-filter（见 retrieve_jobs）。
+    方向 / 学历是表述差异大的软约束，召回为空时逐级放宽，语义检索仍保相关性。
 
-    级联顺序：全过滤 → 去方向 → 去学历（城市始终保留）；
-    仅当用户未指定城市时，才允许最终降到完全不过滤。
-    仅保留彼此不同的级别，避免重复检索。每级返回 (desc, where, effective_tuple)。
+    级联顺序：方向+学历 → 去方向 → 无过滤。每级返回 (desc, where)。
     """
     levels = [
-        (city_filter, direction_filter, education_filter),
-        (city_filter, None, education_filter),  # 去方向（最易导致空召回）
-        (city_filter, None, None),              # 再去学历，城市硬约束保留
+        (direction_filter, education_filter),
+        (None, education_filter),  # 去方向（最易导致空召回）
+        (None, None),              # 无过滤
     ]
-    if not (city_filter and str(city_filter).strip()):
-        levels.append((None, None, None))       # 未指定城市时才允许完全不过滤
     cascade, seen = [], []
-    for city, direction, education in levels:
-        where = build_where_filter(city, direction, education)
+    for direction, education in levels:
+        where = build_where_filter(None, direction, education)
         key = json.dumps(where, ensure_ascii=False, sort_keys=True)
         if key in seen:
             continue
         seen.append(key)
-        desc = _describe_filter(city, direction, education)
-        cascade.append((desc, where, (city, direction, education)))
+        cascade.append((_describe_filter(direction, education), where))
     return cascade
+
+
+def _filter_by_city(hits: list, city_filter) -> list:
+    """城市硬约束 post-filter：只保留工作城市（可多个）含目标城市的岗位。
+
+    基于回填后的 jd_profile.location.cities 判断（多城市岗位任一城市命中即保留）。
+    用户未指定城市时原样返回。这是硬约束——过滤后为空即「该城市无岗」，
+    由上游节点据此提前终止，绝不拿别的城市凑数。
+    """
+    from resume2job.parsing.jd_parser import normalize_city, job_cities
+
+    want = normalize_city(city_filter)
+    if not want:
+        return hits
+    return [h for h in hits if want in job_cities(h.get("jd_profile") or {})]
 
 
 # ===== distance -> similarity =====
@@ -786,6 +784,9 @@ def retrieve_jobs(
 
     top_k = max(1, int(top_k) if isinstance(top_k, (int, float)) else 5)
     per_query_k = top_k * 2  # 每个 Query 多召回，去重后避免不足
+    # 指定城市时扩大召回池：城市在召回后才 post-filter，需保证目标城市岗位先进候选
+    if city_filter and str(city_filter).strip():
+        per_query_k = max(per_query_k, 20)
 
     # 0) 连接 ChromaDB
     if not os.path.isdir(DEFAULT_DB_PATH):
@@ -825,17 +826,12 @@ def retrieve_jobs(
 
     # 2) 过滤级联：从严到松，直到召回到结果；
     #    每级内对（3 个 Query × 启用的通道）各取一个有序命中列表，RRF 融合去重
-    cascade = _build_filter_cascade(city_filter, direction_filter, education_filter)
+    cascade = _build_filter_cascade(direction_filter, education_filter)
 
     merged, used_desc = [], "无过滤"
-    for level_idx, (desc, where, effective) in enumerate(cascade):
+    for level_idx, (desc, where) in enumerate(cascade):
         if level_idx > 0:
-            # 根据本级实际生效的条件给出更贴切的降级提示
-            eff_city, eff_dir, eff_edu = effective
-            if eff_dir is None and (eff_city or eff_edu):
-                print("[WARN] 方向过滤结果为空，降级为仅城市过滤重试。")
-            else:
-                print("[WARN] 过滤结果为空，降级为无过滤重试。")
+            print(f"[WARN] 过滤结果为空，降级重试（{desc}）。")
 
         ranked_lists = []
         for qkey in ("query_1", "query_2", "query_3"):
@@ -863,6 +859,15 @@ def retrieve_jobs(
     if not merged:
         print("[INFO] 所有 Query 与过滤级别均无召回结果，返回空列表。")
         return []
+
+    # 2.5) 城市硬约束 post-filter（基于回填的 cities，支持多城市岗位）
+    if city_filter and str(city_filter).strip():
+        before = len(merged)
+        merged = _filter_by_city(merged, city_filter)
+        print(f"[INFO] 城市过滤「{city_filter}」：{before} → {len(merged)} 条")
+        if not merged:
+            print(f"[INFO] 知识库暂无「{city_filter}」的岗位，返回空列表（硬约束）。")
+            return []
 
     # 3) rerank 精排（可选）：取融合后的头部候选送交叉编码器重排
     candidates = merged[: max(top_k * 2, top_k)]

@@ -49,7 +49,8 @@ JSON_SCHEMA_EXAMPLE = {
     "internship_note": "原文中模糊的实习相关补充说明，如「该岗位可提供实习岗位」",
 
     "location": {
-        "city": "string or null",
+        "cities": ["工作城市列表；多城市岗位（如「北京 / 上海 / 杭州」）必须全部列出"],
+        "city": "首要工作城市 string or null（取 cities 第一个）",
         "district": "string or null",
         "office_address": "string or null"
     },
@@ -115,7 +116,8 @@ SYSTEM_PROMPT = """你是一名资深招聘分析师和岗位信息结构化专�
 - min_internship_months：必须为整数或 null；如「至少3个月」→ 3，「6个月以上」→ 6，「每周至少4天，持续6个月」→ 6。
 - weekly_days_requirement：原文摘要，如「每周至少4天」；无则 null。
 
-- location.city / district / office_address：能拆则拆，不强行编造；多地点取首要工作地。
+- location.cities：列出该岗位**所有**工作城市（原文如「北京 / 广州 / 杭州 / 上海」要全部列出，去掉「市」后缀）；单城市岗位则只含一个。
+- location.city：取 cities 的第一个（首要工作地）；location.district / office_address：能拆则拆，不强行编造。
 - work_mode：规范化到「现场 / 远程 / 混合 / null」。
 - benefits：薪资之外的福利（餐补、住宿、转正机会、五险一金等）。
 - highlights：岗位亮点（如「大模型核心业务」「有转正机会」「技术栈贴近前沿」）。
@@ -157,7 +159,7 @@ DEFAULT_JD = {
     "weekly_days_requirement": None,
     "internship_note": None,
 
-    "location": {"city": None, "district": None, "office_address": None},
+    "location": {"cities": [], "city": None, "district": None, "office_address": None},
     "work_mode": None,
     "salary": None,
     "benefits": [],
@@ -289,11 +291,35 @@ def _dedup_keep_order(items: list) -> list:
     return result
 
 
+def normalize_city(city) -> str:
+    """城市值规范化：去空白并去掉「市」后缀，使「北京市」与「北京」对齐。
+
+    岗位库内城市统一存规范形（「北京」），通勤住址抽出的城市常带「市」，
+    检索 / 城市硬约束判断前都过一遍此函数，避免「北京市」≠「北京」的误判。
+    解析层（cities 抽取）与检索层（城市过滤）共用同一规则。
+    """
+    s = str(city).strip() if city else ""
+    return s[:-1] if s.endswith("市") and len(s) > 2 else s
+
+
+def job_cities(jd_profile: dict) -> list:
+    """取岗位的规范化工作城市列表（多城市岗位返回多个）。
+
+    优先 location.cities；缺失（老库未迁移）时回退到 [location.city]。
+    """
+    loc = (jd_profile or {}).get("location") or {}
+    cities = loc.get("cities")
+    if isinstance(cities, list) and cities:
+        return _dedup_keep_order([normalize_city(c) for c in cities])
+    one = normalize_city(loc.get("city"))
+    return [one] if one else []
+
+
 def validate_jd_profile(data: dict) -> dict:
     """对 LLM 输出做结构校验：
     - 顶层缺失键补默认值；
     - 类型不匹配回退；
-    - location 子字段补齐；
+    - location 子字段补齐（cities 多城市列表 + city 首要城市）；
     - 列表字段保证为 list；
     - 布尔字段保证为 bool 或 None；
     - risk_points 强制为对象列表（每项含 type/description/evidence）；
@@ -307,15 +333,29 @@ def validate_jd_profile(data: dict) -> dict:
     for key, default in DEFAULT_JD.items():
         result[key] = _ensure_type(data.get(key, default), default)
 
-    # 2) location 子字段补齐
+    # 2) location 子字段补齐（cities 为 list，其余为 str/None）
     loc_default = DEFAULT_JD["location"]
     loc_value = result["location"] if isinstance(result["location"], dict) else {}
     merged_loc = {**loc_default, **loc_value}
-    for k, v in loc_default.items():
-        if not isinstance(merged_loc.get(k), (str, type(None))):
-            merged_loc[k] = v
-        elif isinstance(merged_loc.get(k), str) and not merged_loc[k].strip():
+    for k in ("city", "district", "office_address"):
+        v = merged_loc.get(k)
+        if not isinstance(v, (str, type(None))):
             merged_loc[k] = None
+        elif isinstance(v, str) and not v.strip():
+            merged_loc[k] = None
+    # cities：规范化为去重、去「市」后缀的城市列表；与 city 互相补全
+    raw_cities = merged_loc.get("cities")
+    cities = _dedup_keep_order([normalize_city(c) for c in raw_cities]) \
+        if isinstance(raw_cities, list) else []
+    main_city = normalize_city(merged_loc.get("city"))
+    if not cities and main_city:
+        cities = [main_city]            # 仅给了单 city：补成单元素列表
+    if cities and not main_city:
+        main_city = cities[0]           # 仅给了 cities：city 取首位
+    if main_city and main_city not in cities:
+        cities = [main_city] + cities   # city 不在列表里：并入并置顶
+    merged_loc["cities"] = cities
+    merged_loc["city"] = main_city or None
     result["location"] = merged_loc
 
     # 3) 标量字段类型修正
@@ -682,6 +722,26 @@ def infer_job_type(data: dict, jd_text: str) -> dict:
     return data
 
 
+# 集团统招 JD（如阿里「在招业务」列表式 JD）常无显式公司名，LLM 偶发抽空。
+# 文本含这些信号时回填集团名，避免同批岗位 company 一会儿「阿里巴巴」一会儿「未知公司」。
+_GROUP_COMPANY_SIGNALS = [
+    ("阿里巴巴", ("阿里巴巴", "淘天集团", "阿里云", "钉钉", "阿里国际", "阿里星", "千问")),
+]
+
+
+def infer_company(data: dict, jd_text: str) -> dict:
+    """company 缺失 / 为 unknown 时，依据集团统招信号回填集团名。"""
+    company = data.get("company")
+    if isinstance(company, str) and company.strip() and "unknown" not in company.lower():
+        return data
+    text = jd_text or ""
+    for group_name, signals in _GROUP_COMPANY_SIGNALS:
+        if sum(1 for s in signals if s in text) >= 2:  # 至少命中 2 个信号才回填，防误判
+            data["company"] = group_name
+            break
+    return data
+
+
 # ===== 主流程 =====
 def parse_jd(jd_text: str) -> dict:
     """主流程：LLM 抽取 -> 清洗 -> 解析 -> Schema 补齐 -> 规则后处理。失败返回 {}。"""
@@ -711,6 +771,7 @@ def parse_jd(jd_text: str) -> dict:
     profile = normalize_jd_skills(profile)  # 拆分长句技能、分流优先/加分项
     profile = normalize_risk_points(profile)
     profile = infer_job_type(profile, jd_text)
+    profile = infer_company(profile, jd_text)  # 集团统招 JD 公司名兜底
 
     return profile
 

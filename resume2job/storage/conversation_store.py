@@ -5,8 +5,8 @@ storage/conversation_store.py
 
 与 profile_cache（记住"你是谁"）配合，conversation_store 记住"我们聊过什么"：
     - 每一轮把 user / assistant 两条消息按时间写入 SQLite；
-    - 下一轮按 session_id 读回最近若干条历史，喂给意图识别等节点，
-      让"换成上海的岗位""那第二个呢"这类依赖上下文的追问可被正确理解。
+    - 下一轮按 session_id 读回最近若干条历史，作为意图识别的**兜底上下文**参考
+      （结构化会话态 last_results/candidate_pool 缺失时才用，且只取前若干字喂 planner）。
 
 与 user_profiles / jobs 共用同一个 data/resume2job.db（见 storage/paths.py）。
 """

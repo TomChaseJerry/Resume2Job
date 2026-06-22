@@ -12,7 +12,9 @@
 
 流程：
     1. Python 规则计算 skill_score（分层证据 + 可替代必备）
-    2. LLM 计算 project_score（5 档 rubric 打分）
+    2. LLM 计算 project_score（5 档 rubric 打分）——候选池**惰性评分**（with_project=False）时
+       跳过此步、用 skill 作 match_score 代理；展示批次由 apply_project_scores_batch **1 次批量
+       LLM**（1 简历项目摘要 + N 精简 JD → N 分，逐岗独立、禁止横向比较）精算，省 LLM 调用次数
     3. Python 加权得到 match_score
     4. Python 规则计算 direction_bonus（方向标签映射，确定性）
     5. Python 规则计算 commute_bonus（通勤时长分级；评分阶段通常为 0，增强阶段回填）
@@ -853,6 +855,119 @@ def call_llm_score(resume_profile: dict, jd_profile: dict) -> dict:
     return validate_llm_score_result(parsed, default_score=default_score)
 
 
+# ===== 3b. 批量 project_score（1 简历项目摘要 + N 精简 JD → 1 次 LLM → N 分，逐岗独立）=====
+def _build_user_prompt_for_score_batch(resume_subset: dict, jd_subsets: list) -> str:
+    """构造**批量** project_score 打分 User Prompt：候选人项目摘要只放一份，N 个岗位各自独立打分。
+
+    关键约束：逐岗独立、**禁止横向比较**（不得因其他岗位高/低而调整某岗位分）。
+    """
+    resume_str = json.dumps(resume_subset, ensure_ascii=False, indent=2)
+    jobs_blocks = []
+    for i, jd in enumerate(jd_subsets, start=1):
+        jobs_blocks.append(f"--- 岗位 id={i} ---\n" + json.dumps(jd, ensure_ascii=False, indent=2))
+    jobs_str = "\n\n".join(jobs_blocks)
+    n = len(jd_subsets)
+
+    return (
+        "【评分任务】project_score（批量，逐岗独立）\n\n"
+        f"{PROJECT_RUBRIC}\n\n"
+        "【独立评分要求（必须严格遵守）】\n"
+        "请分别独立评估每个岗位与候选人项目经历的相关性。\n"
+        "不得因其他岗位得分高或低而调整某岗位分数。\n"
+        "每个岗位只能依据该岗位职责、核心技能与候选人项目证据评分。\n\n"
+        "===== 候选人项目经历（所有岗位共用，仅此一份）=====\n"
+        f"{resume_str}\n\n"
+        f"===== 待评分岗位（共 {n} 个，逐个独立打分）=====\n"
+        f"{jobs_str}\n\n"
+        "===== 输出 JSON Schema =====\n"
+        '{\n'
+        '  "scores": [\n'
+        '    {"id": 1, "score": 0/25/50/75/100 之一, "evidence": ["匹配证据", "主要缺口", "简短理由"]}\n'
+        '    // ... 每个岗位一项，id 与上面岗位对应 ...\n'
+        '  ]\n'
+        '}\n\n'
+        f"必须为上面全部 {n} 个岗位各返回一项（id 与岗位一一对应），共 {n} 项；"
+        "直接输出 JSON 对象本体，不要任何额外文字或 Markdown 包装。"
+    )
+
+
+def _distribute_batch_scores(parsed, n: int) -> list:
+    """把批量 LLM 输出还原成长度 n、按岗位顺序对齐的 [{score, evidence}]。
+
+    优先按 id 映射（容忍 LLM 调序）；无可用 id 但数量吻合则按顺序兜底；缺失/多余/畸形一律补保守默认。
+    每项复用 validate_llm_score_result 做 score/evidence 规范化。
+    """
+    default = {"score": 50, "evidence": ["批量评分未覆盖该岗位，使用保守分数。"]}
+    out = [None] * n
+    if isinstance(parsed, dict):
+        items = parsed.get("scores")
+    elif isinstance(parsed, list):
+        items = parsed
+    else:
+        items = None
+
+    if isinstance(items, list):
+        # 1) 优先按 id（1-based）映射，容忍乱序
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            try:
+                idx = int(it.get("id")) - 1
+            except (TypeError, ValueError):
+                continue
+            if 0 <= idx < n and out[idx] is None:
+                out[idx] = validate_llm_score_result(it, default_score=50)
+        # 2) 无可用 id 但条数吻合 → 按顺序兜底
+        if all(o is None for o in out) and len(items) == n:
+            for i, it in enumerate(items):
+                if isinstance(it, dict):
+                    out[i] = validate_llm_score_result(it, default_score=50)
+
+    return [o if o is not None else dict(default) for o in out]
+
+
+def call_llm_score_batch(resume_profile: dict, jd_profiles: list) -> list:
+    """**批量** LLM 项目评分：1 个候选人项目摘要 + N 个精简 JD → **1 次 LLM 调用** → N 个 project_score。
+
+    逐岗独立打分（prompt 明确禁止横向比较）。返回与 jd_profiles 等长、一一对应的 [{score, evidence}]。
+    任何失败 → 全部回退保守默认（与 call_llm_score 一致），**绝不抛**（单次调用顶替原 N 次/岗）。
+    """
+    n = len(jd_profiles)
+    default = {"score": 50, "evidence": ["批量项目评分不可用，使用保守分数。"]}
+    if n == 0:
+        return []
+
+    resume_subset = _resume_subset_for_project(resume_profile)
+    jd_subsets = [_jd_subset_for_project(jd if isinstance(jd, dict) else {}) for jd in jd_profiles]
+
+    try:
+        api_key = get_api_key()
+    except RuntimeError:
+        print("[ERROR] 环境变量 DASHSCOPE_API_KEY 未设置，使用保守分数（批量 project_score）。")
+        return [dict(default) for _ in range(n)]
+
+    user_prompt = _build_user_prompt_for_score_batch(resume_subset, jd_subsets)
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key, base_url=BASE_URL)
+        completion = client.chat.completions.create(
+            model=SCORE_MODEL_NAME,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT_SCORE},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.0,
+            extra_body={"enable_thinking": False},
+        )
+        raw = (completion.choices[0].message.content or "").strip()
+    except Exception as e:
+        print(f"[ERROR] LLM 调用失败（project_score 批量）：{e}")
+        return [dict(default) for _ in range(n)]
+
+    parsed = safe_json_parse(raw)
+    return _distribute_batch_scores(parsed, n)
+
+
 # ===== 5. risk_analysis：Python 规则生成 =====
 _EXPERIENCE_YEAR_PATTERN = re.compile(r"(\d+)\s*[-~]?\s*(\d+)?\s*年")
 
@@ -1198,28 +1313,42 @@ def generate_summary(result: dict) -> str:
 
 # ===== 主函数 =====
 def score_match(resume_profile: dict, jd_profile: dict,
-                user_direction_tags=None) -> dict:
+                user_direction_tags=None, with_project: bool = True) -> dict:
     """完整评分流程（两层评分）。
 
     user_direction_tags：用户方向偏好标签（list 或 {tag: weight}），用于 direction_bonus；
     通勤加分 commute_bonus 在评分阶段未知（通勤在增强节点计算），此处置 0，
     由 enhancement 节点算完通勤后回填并重算 rank_score。
+
+    with_project：是否立即调 LLM 算 project_score。
+      - True（默认，单 JD 评估 / CLI / eval）：完整两层评分；
+      - False（候选池**惰性评分**）：跳过 project LLM，用 skill_score 作 match_score 的中性代理
+        （假定 project≈skill，与 skill 同 0~100 量纲，仅供候选池排序），并置 project_pending=True；
+        该岗位进入**展示批次**时再由 apply_project_score 精算 project 并刷新 match_score/rank_score。
+        project LLM 是评分主瓶颈，全候选池每岗一次会拖垮大候选池场景，故只对展示岗位付费
+        （见 nodes/executor 的 _finalize_projects）。
     """
     # 1. 技能分（规则）
     skill_result = calculate_skill_score(resume_profile, jd_profile)
     # 2. 学历分（规则）—— 仅供风险分析的学历门槛判定，不计入评分
     education_result = calculate_education_score(resume_profile, jd_profile)
-    # 3. 项目分（LLM，5 档 rubric）
-    project_result = call_llm_score(resume_profile, jd_profile)
+    # 3. 项目分（LLM，5 档 rubric）；惰性模式跳过，用 skill 作中性代理
+    if with_project:
+        project_result = call_llm_score(resume_profile, jd_profile)
+        match_score = calculate_match_score(skill_result["score"], project_result["score"])
+        project_pending = False
+    else:
+        project_result = {"score": skill_result["score"],
+                          "evidence": ["项目分惰性未计算（仅对展示岗位精算）。"], "pending": True}
+        match_score = skill_result["score"]   # 中性代理：假定 project≈skill，仅供候选池排序
+        project_pending = True
     # 4. 风险分析（规则 + JD risk_points 合并）
     risks = generate_risk_analysis(resume_profile, jd_profile, skill_result, education_result)
-    # 5. 基础适配分 match_score（技能 + 项目两维加权）
-    match_score = calculate_match_score(skill_result["score"], project_result["score"])
-    # 6. 方向偏好加分（确定性标签映射）；通勤加分评分阶段为 0
+    # 5. 方向偏好加分（确定性标签映射）；通勤加分评分阶段为 0
     direction_bonus_info = compute_direction_bonus(jd_profile, user_direction_tags)
     direction_bonus = direction_bonus_info["bonus"]
     commute_bonus = 0.0
-    # 7. 排序分 rank_score + 推荐等级
+    # 6. 排序分 rank_score + 推荐等级
     rank_score = calculate_rank_score(match_score, direction_bonus, commute_bonus)
     match_level = judge_match_level(rank_score)
 
@@ -1234,11 +1363,62 @@ def score_match(resume_profile: dict, jd_profile: dict,
         "commute_bonus": commute_bonus,
         "rank_score": rank_score,
         "match_level": match_level,
+        "project_pending": project_pending,  # True=项目分待惰性精算（apply_project_score）
         "summary": "",
     }
-    # 8. summary
+    # 7. summary
     result["summary"] = generate_summary(result)
     return result
+
+
+def _recompute_after_project(result: dict, project_result: dict) -> dict:
+    """用精算出的 project_result 刷新 result 的 project_score / match_score / rank_score /
+    match_level / summary 并清 project_pending。就地修改并返回。单/批量精算共用。"""
+    skill_score = (result.get("skill_score") or {}).get("score", 0)
+    result["project_score"] = project_result
+    result["match_score"] = calculate_match_score(skill_score, project_result.get("score", 50))
+    result["rank_score"] = calculate_rank_score(
+        result["match_score"], result.get("direction_bonus", 0.0), result.get("commute_bonus", 0.0))
+    result["match_level"] = judge_match_level(result["rank_score"])
+    result["project_pending"] = False
+    result["summary"] = generate_summary(result)
+    return result
+
+
+def apply_project_score(resume_profile: dict, jd_profile: dict, result: dict) -> dict:
+    """惰性精算（**单岗**）：对 with_project=False 产出的评分补算 project_score（一次 LLM）并刷新
+    match_score / rank_score / match_level / summary。已精算（project_pending=False）直接返回。
+
+    **就地修改并返回** result（result 即候选池项的 match_score 字典）。展示**批次**请用
+    apply_project_scores_batch（1 次 LLM 出 N 分），此单岗版供单 JD/特殊路径兜底。
+    """
+    if not isinstance(result, dict) or not result.get("project_pending"):
+        return result
+    return _recompute_after_project(result, call_llm_score(resume_profile, jd_profile))
+
+
+def apply_project_scores_batch(resume_profile: dict, results: list, jd_profiles: list) -> list:
+    """惰性精算（**批量**）：对一批 (result, jd) 用 **1 次 LLM** 算出各自 project_score 并分别刷新。
+
+    results 与 jd_profiles 一一对应。只精算其中 project_pending 的（已精算的跳过），把展示批次原本
+    「每岗一次 project LLM」降为「整批一次」。逐岗独立打分（call_llm_score_batch 内禁止横向比较）。
+    就地修改 results 并返回；**绝不抛**（批量调用失败时由 _distribute/兜底给保守默认，不留 pending 残值）。
+    """
+    pending_idx = [i for i, r in enumerate(results)
+                   if isinstance(r, dict) and r.get("project_pending")]
+    if not pending_idx:
+        return results
+    try:
+        project_results = call_llm_score_batch(
+            resume_profile, [jd_profiles[i] for i in pending_idx])
+    except Exception as e:   # call_llm_score_batch 已自兜底，这里再兜一层防御
+        print(f"[ERROR] 批量 project 评分异常，全部保守默认：{e}")
+        project_results = []
+    for k, i in enumerate(pending_idx):
+        pr = (project_results[k] if k < len(project_results)
+              else {"score": 50, "evidence": ["批量评分缺失，保守默认。"]})
+        _recompute_after_project(results[i], pr)
+    return results
 
 
 # ===== CLI =====

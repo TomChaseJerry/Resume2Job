@@ -3,14 +3,17 @@
 
 批量解析 jd_folder 下的 .txt JD 文件，按「SQLite 事实源 + Chroma 索引」分层入库：
     - SQLite jobs 表：原文、完整 jd_profile、index_text 等全部业务数据（事实源）；
-    - Chroma：embedding + document(index_text) + 最小可过滤 metadata（索引投影）。
+    - Chroma：embedding + document(index_text) + 最小投影 metadata（job_id + 展示标量；
+      硬约束改 SQLite eligibility 召回前预筛，详见 jobs_store / retriever 模块说明）。
 
 流程（每个文件）：
-    读取原文 -> 取画像（SQLite 已有则复用，否则 parse_jd，省 token）
+    读取原文 -> 取画像（SQLite 已有**且 JD 原文哈希未变**则复用，否则 parse_jd，省 token）
         -> upsert SQLite（事实源始终刷新）
-        -> 未在向量库则 embedding + 写入 Chroma
+        -> 不在向量库 / JD 原文已变 则 embedding + 写入 Chroma（原文变了先删旧向量再重嵌入）
     -> 汇总日志
 
+幂等：JD 原文不变时重跑全跳过；原文改了（同 job_id）会自动重解析 + 重嵌入，避免
+「BM25/SQLite 看新 JD、dense 看旧向量」的双通道陈旧。
 换 embedding 模型后用 scripts/rebuild_index.py 从 SQLite 重建 Chroma，无需重新解析。
 """
 
@@ -81,14 +84,14 @@ def build_index_text(jd_profile: dict) -> str:
     return "\n".join(parts)
 
 
-# ===== Chroma metadata 构建（最小投影：只放检索 pre-filter 需要的标量）=====
+# ===== Chroma metadata 构建（最小投影：job_id 供 where $in 限定 + 少量展示标量）=====
 def build_chroma_metadata(job_id: str, jd_profile: dict, source: str = "batch_indexed") -> dict:
     """构建写入 ChromaDB 的最小 metadata。
 
-    架构约定：完整结构化画像存 SQLite（事实源，见 storage/jobs_store.py），
-    Chroma metadata 只保留向量检索 pre-filter 必需的标量（city / direction /
-    education_level）及少量展示/调试字段。Chroma 1.x metadata 值不接受 None，
-    缺失字段直接不写入该 key。
+    架构约定：完整结构化画像存 SQLite（事实源，见 storage/jobs_store.py）。硬约束 pre-filter
+    已移到 SQLite eligibility（召回前预筛 allowed_job_ids），Chroma metadata 只保留 job_id
+    （供检索时 where job_id $in 限定范围）+ 少量展示/调试标量（city / direction / education_level）。
+    Chroma 1.x metadata 值不接受 None，缺失字段直接不写入该 key。
     """
     if not isinstance(jd_profile, dict):
         jd_profile = {}
@@ -218,12 +221,17 @@ def index_jobs(jd_folder: str, db_path: str = DEFAULT_DB_PATH,
             skip_count += 1
             continue
 
-        # 4) 取画像：SQLite 已有则复用（零 token），否则 parse_jd
+        # 4) 取画像：SQLite 已有**且 JD 原文未变（哈希一致）**则复用（零 token）；
+        #    原文变了则重解析——否则 SQLite 复用旧画像、Chroma 留旧向量，造成双通道不一致。
+        cur_hash = compute_jd_hash(jd_text)
         existing = jobs_store.get_job(job_id)
-        jd_profile = existing["jd_profile"] if existing and existing.get("jd_profile") else None
-        if jd_profile:
-            print(f"[INFO] 画像已在 SQLite，复用：{job_id}")
+        content_changed = bool(existing) and existing.get("jd_hash") != cur_hash
+        if existing and existing.get("jd_profile") and not content_changed:
+            jd_profile = existing["jd_profile"]
+            print(f"[INFO] 画像已在 SQLite 且原文未变，复用：{job_id}")
         else:
+            if content_changed:
+                print(f"[INFO] JD 原文已变（哈希不一致），重新解析并刷新向量：{job_id}")
             try:
                 jd_profile = parse_jd(jd_text)
             except Exception as e:
@@ -251,11 +259,18 @@ def index_jobs(jd_folder: str, db_path: str = DEFAULT_DB_PATH,
             fail_count += 1
             continue
 
-        # 6) 已在向量库：跳过向量化（省 token）
-        if job_exists(collection, job_id):
-            print(f"[SKIP] job_id 已存在（向量库）：{job_id}")
+        # 6) 向量库写入：原文未变且已存在则跳过（省 token）；原文已变则删旧向量后重嵌入，保持两通道一致
+        in_chroma = job_exists(collection, job_id)
+        if in_chroma and not content_changed:
+            print(f"[SKIP] job_id 已存在且原文未变（向量库）：{job_id}")
             skip_count += 1
             continue
+        if in_chroma and content_changed:
+            try:
+                collection.delete(ids=[job_id])
+                print(f"[INFO] 删除旧向量，准备重嵌入：{job_id}")
+            except Exception as e:
+                print(f"[WARN] 删除旧向量失败（将直接覆盖写入）：{e}")
 
         # 7) 获取向量并写入 Chroma（最小可过滤 metadata）
         try:
@@ -318,9 +333,8 @@ def main():
         print("[TEST] collection 为空，跳过读取测试")
         return
 
-    jd_test_len = 5
-    sample = collection.get(limit=jd_test_len, include=["documents", "metadatas"])
-    for i in range(jd_test_len):
+    sample = collection.get(limit=5, include=["documents", "metadatas"])
+    for i in range(len(sample.get("ids") or [])):   # 按实际回读条数遍历，库内不足 5 条也不越界
         sample_id = sample["ids"][i]
         metadata = sample["metadatas"][i]
         document = sample["documents"][i]

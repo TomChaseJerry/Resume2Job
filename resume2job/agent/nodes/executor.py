@@ -28,7 +28,7 @@ from resume2job.parsing.jd_parser import parse_jd
 from resume2job.retrieval.retriever import retrieve_jobs
 from resume2job.retrieval.indexer import lookup_ingested_jd_profile
 from resume2job.scoring.match_scorer import (
-    score_match, compute_direction_bonus, calculate_rank_score, judge_match_level,
+    score_match, apply_project_scores_batch, compute_direction_bonus, calculate_rank_score, judge_match_level,
 )
 # 合并调用（1 次 LLM 产出 skill_gap + 报告）+ 纯 Python 重组 + 规则兜底完整报告 + 规则兜底 skill_gap
 # （skill_gap 视图 2026-06-21 已并入 recommendation 报告层，不再有独立 scoring/skill_gap 模块）
@@ -350,14 +350,36 @@ def jd_analyzer_node(state: AgentState) -> AgentState:
 # ---------------------------------------------------------------------------
 
 def _score_one_job(resume_profile: dict, jd_profile: dict, job_id: str,
-                   errors: list, user_direction_tags=None):
-    """只评分（score_match：project 一次 LLM + 规则）→ match_score，供候选池排序。
+                   errors: list, user_direction_tags=None, with_project: bool = False):
+    """候选池评分：默认**惰性**（with_project=False，跳过 project LLM，用 skill 作 match_score
+    代理供排序），展示批次再由 _finalize_projects 精算 project。
     **不**生成 skill_gap / 报告（那是展示岗位才做的惰性叙述）。失败返回 None。"""
     try:
-        return score_match(resume_profile, jd_profile, user_direction_tags)
+        return score_match(resume_profile, jd_profile, user_direction_tags, with_project=with_project)
     except Exception as exc:
         errors.append(f"match_scorer_node: 岗位 {job_id} 评分失败：{exc}")
         return None
+
+
+def _finalize_projects(batch: list, resume_profile: dict, errors: list) -> None:
+    """对展示批次惰性精算 project_score：把 project_pending 的岗位**整批一次 LLM**（1 简历项目摘要
+    + N 精简 JD → N 分，逐岗独立、禁止横向比较）算出 project 并就地刷新各自 match_score / rank_score。
+    非 pending（已精算/复用缓存）跳过。**就地刷新**候选池项。
+
+    与 _narrate_batch 配对：每批展示岗位先 _finalize_projects 一次精算 project，再 _narrate_batch 叙述。
+    """
+    pending = [mr for mr in batch
+               if isinstance(mr, dict) and (mr.get("match_score") or {}).get("project_pending")]
+    if not pending:
+        return
+    try:
+        apply_project_scores_batch(
+            resume_profile,
+            [mr["match_score"] for mr in pending],     # 与 jd 一一对应，就地刷新
+            [mr.get("jd_profile") or {} for mr in pending],
+        )
+    except Exception as exc:   # apply_project_scores_batch 已自兜底，这里再隔离一层
+        errors.append(f"match_scorer_node: 批量项目分精算失败（已隔离）：{exc}")
 
 
 def _ensure_narrated(mr: dict, resume_profile: dict, errors: list) -> dict:
@@ -443,8 +465,11 @@ def _serve_next_batch(state: AgentState) -> AgentState:
         return new_state
     batch = unshown[:display_k]
     errors = list(state.get("errors") or [])
-    _narrate_batch(batch, state.get("resume_profile") or {}, errors)  # 惰性叙述新展示岗位
-    new_state["candidate_pool"] = pool  # 池项被就地写入叙述缓存，整池回存
+    resume_profile = state.get("resume_profile") or {}
+    _finalize_projects(batch, resume_profile, errors)  # 惰性精算新展示岗位的 project
+    batch.sort(key=lambda r: (r.get("match_score") or {}).get("rank_score", 0), reverse=True)
+    _narrate_batch(batch, resume_profile, errors)  # 惰性叙述新展示岗位
+    new_state["candidate_pool"] = pool  # 池项被就地写入精算/叙述缓存，整池回存
     new_state["match_results"] = batch
     new_state["shown_job_ids"] = list(shown | {r.get("job_id") for r in batch})
     new_state["skill_gaps"] = [{"job_id": r.get("job_id"),
@@ -480,7 +505,10 @@ def _rerank_pool(state: AgentState) -> AgentState:
     pool.sort(key=lambda r: (r.get("match_score") or {}).get("rank_score", 0), reverse=True)
     batch = pool[:display_k]
     errors = list(state.get("errors") or [])
-    _narrate_batch(batch, state.get("resume_profile") or {}, errors)  # 缓存→重组报告刷新分数，新岗位→LLM
+    resume_profile = state.get("resume_profile") or {}
+    _finalize_projects(batch, resume_profile, errors)  # 精算进入展示的岗位 project（pending 的才调 LLM）
+    batch.sort(key=lambda r: (r.get("match_score") or {}).get("rank_score", 0), reverse=True)
+    _narrate_batch(batch, resume_profile, errors)  # 缓存→重组报告刷新分数，新岗位→LLM
     new_state = dict(state)
     new_state["candidate_pool"] = pool
     new_state["match_results"] = batch
@@ -499,12 +527,14 @@ def match_scorer_node(state: AgentState) -> AgentState:
     """评分 + 惰性叙述（解析建议：技能差距与报告合并为一次 LLM、且只对展示岗位生成）。
 
     会话动作分支（item8）：
-      - next_batch：从候选池取下一批未展示岗位，惰性叙述（不重评分）；
-      - reuse_pool（REUSE_RERANK）：复用池仅重算方向偏好分重排，惰性叙述 Top-N（不重评分）；
-      - 否则（RETRIEVE/USER_JD）：① 整池只评分（project 一次 LLM/岗）→ 按 rank_score 排序；
-        ② **只对展示 Top-N 惰性叙述**（一次合并 LLM 产出 skill_gap + 报告），未展示岗位换一批时再叙述。
+      - next_batch：从候选池取下一批未展示岗位，精算 project + 惰性叙述（不重算 skill/方向）；
+      - reuse_pool（REUSE_RERANK）：复用池仅重算方向偏好分重排，展示 Top-N 精算 project + 叙述；
+      - 否则（RETRIEVE/USER_JD）：① 整池**惰性评分**（仅 skill+方向，纯 Python，无 project LLM）
+        → 按 rank_score 排序；② **只对展示 Top-N** 精算 project（整批 1 次 LLM，逐岗独立）+ 惰性叙述
+        （一次合并 LLM 产出 skill_gap + 报告），未展示岗位换一批/进 Top-N 时再精算+叙述。
 
-    单岗评分/叙述失败不中断其它；结果按 rank_score 降序。
+    project LLM 只对展示批次付费且整批 1 次（_finalize_projects→apply_project_scores_batch），
+    把「全候选池每岗一次 LLM」降为「仅展示批次整批一次」。单岗评分/叙述失败不中断其它；按 rank_score 降序。
     """
     print("[match_scorer_node] 开始执行...")
 
@@ -537,32 +567,29 @@ def match_scorer_node(state: AgentState) -> AgentState:
     errors = list(state.get("errors") or [])
     user_direction_tags = list((state.get("preference_tags") or {}).keys())
 
-    # 1) 整池只评分（project 一次 LLM/岗 + 规则）→ match_score，并发跑；不生成 skill_gap/报告
+    # 1) 整池**惰性评分**：只算 skill + direction（规则，纯 Python，无 LLM），project 待展示再精算。
+    #    project LLM 是评分瓶颈——全候选池每岗一次会拖垮大候选池/通勤场景，故只对展示岗位付费。
     pool: list[MatchResult] = []
-    workers = min(8, len(jd_profiles))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {}
-        for idx, jd_profile in enumerate(jd_profiles):
-            job_id = get_job_id(jd_profile, idx)
-            fut = ex.submit(_score_one_job, resume_profile, jd_profile, job_id, errors, user_direction_tags)
-            futs[fut] = (job_id, jd_profile)
-        for fut in concurrent.futures.as_completed(futs):
-            job_id, jd_profile = futs[fut]
-            match_score = fut.result()
-            if match_score is None:  # 评分失败 -> 跳过该岗位
-                continue
-            pool.append(MatchResult(job_id=job_id, jd_profile=jd_profile,
-                                    match_score=match_score, skill_gap={}, report=""))
+    for idx, jd_profile in enumerate(jd_profiles):
+        job_id = get_job_id(jd_profile, idx)
+        match_score = _score_one_job(resume_profile, jd_profile, job_id, errors,
+                                     user_direction_tags, with_project=False)
+        if match_score is None:  # 评分失败 -> 跳过该岗位
+            continue
+        pool.append(MatchResult(job_id=job_id, jd_profile=jd_profile,
+                                match_score=match_score, skill_gap={}, report=""))
 
-    # 2) 按 rank_score 降序排序
+    # 2) 按（惰性）rank_score 降序排序：project 未精算的用 skill 代理，与精算后同 0~100 量纲
     pool.sort(key=lambda r: (r.get("match_score") or {}).get("rank_score", 0), reverse=True)
 
-    # 3) 只对展示 Top-N 惰性叙述（一次合并 LLM/岗，产出 skill_gap + 报告）
+    # 3) 展示 Top-N：先精算 project（并发 LLM）刷新 rank_score、头部内重排，再惰性叙述（合并 LLM 出 gap+报告）
     display_k = _display_k(state)
     shown = pool[:display_k]
+    _finalize_projects(shown, resume_profile, errors)
+    shown.sort(key=lambda r: (r.get("match_score") or {}).get("rank_score", 0), reverse=True)
     _narrate_batch(shown, resume_profile, errors)
 
-    new_state["candidate_pool"] = pool                  # 全量评分候选池（含未叙述）供换一批/重排
+    new_state["candidate_pool"] = pool                  # 候选池（展示 Top-N 已精算 project，其余惰性待精算）供换一批/重排
     new_state["match_results"] = shown
     new_state["shown_job_ids"] = [r.get("job_id") for r in shown]
     new_state["skill_gaps"] = [{"job_id": r.get("job_id"),
@@ -570,5 +597,5 @@ def match_scorer_node(state: AgentState) -> AgentState:
                                 "title": (r.get("jd_profile") or {}).get("title"),
                                 **(r.get("skill_gap") or {})} for r in shown]
     new_state["errors"] = errors
-    print(f"[match_scorer_node] 评分 {len(pool)} 个（候选池），叙述展示 Top-{len(shown)}（合并调用）。")
+    print(f"[match_scorer_node] 惰性评分 {len(pool)} 个（候选池，仅 skill+方向），展示 Top-{len(shown)} 精算 project + 叙述。")
     return new_state

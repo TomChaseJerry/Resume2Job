@@ -1,18 +1,20 @@
 """
-推荐报告生成模块（Recommendation Writer）
+推荐报告生成模块（Recommendation Writer）+ 技能差距视图（原 scoring/skill_gap.py 已并入本模块）。
 
-输入：JD Profile + Match Result（+ 可选 skill_gap）
-输出：面向用户的中文纯文本推荐报告
+输入：JD Profile + Match Result；输出：面向用户的中文纯文本推荐报告 + skill_gap dict。
 
-分工：
-    - 【推荐岗位】/【综合匹配分】/【匹配亮点】/【风险提示】 → Python 拼接（保证格式稳定）
-    - 【推荐理由】/【投递建议】                            → LLM 生成（保证语义自然，兜底文案随语气切换）
+分工（与项目「LLM 负责语义、Python 负责确定性编排」一致）：
+    - Python 拼接（格式稳定）：【推荐岗位】/【综合匹配分】(两层 match_score + rank_score)/
+      【匹配亮点】/【技能差距分析】/【风险提示】；
+    - **一次合并 LLM 调用**（generate_report_and_gap → call_llm_report_and_gap）产出
+      {技能差距 items(仅叙述) + 推荐理由 reason + 投递建议 suggestion}，把原本多次调用降为 1 次。
 
-新增（V2）：
-    - adjust_recommendation_tone()：根据评分降级 maybe → cautious
-    - filter_unsafe_skill_claims()：避免无证据的语言类技能被强化
-    - format_risk_points 增加优先级排序
-    - format_evidence 修正标点重复问题
+技能差距视图（见下方「技能差距视图」一节）：**status 由规则唯一决定**——取 match_scorer 的
+skill_status（同义词/上下位/弱匹配/可替代组全套规则），LLM 只补 gap_reason/suggestion/evidence 叙述，
+保证 skill_gap 展示与 skill_score 完全一致；learning_plan / interview 消费同一个 skill_gap dict。
+
+换一批/重排不重调 LLM：recompose_report 用缓存的 reason/suggestion + 当前 match_score 纯 Python 重组。
+LLM 不可用处处兜底（rule_based_skill_gap / generate_full_report 走规则文案）。
 """
 
 import os
@@ -28,7 +30,7 @@ from resume2job.core.llm import call_llm as _core_call_llm, safe_json_parse
 # 技能差距视图所需的规则层工具：status 由 match_scorer 的 skill_status 唯一权威决定，
 # 本模块（见下方「技能差距视图」一节）只按归一名查 status + 组装展示视图，不做任何匹配判定。
 from resume2job.scoring.match_scorer import _normalize_skill as _norm_skill
-from resume2job.parsing.jd_parser import split_compound_skill
+from resume2job.parsing.jd_parser import split_compound_skill, job_cities
 
 
 # ===== 统一的「分数 → 档位」映射（单一事实来源）=====
@@ -655,7 +657,9 @@ def _compose_report(
 
     # 5) Python 拼接固定模板
     lines = []
-    lines.append(f"【推荐岗位】{company} - {title}")
+    # 地点未明确（JD 无城市，召回时按 city_status=unknown 进池）：在岗位标题处提示投递前确认
+    loc_note = "（地点未明确，建议投递前确认）" if not job_cities(jd_profile) else ""
+    lines.append(f"【推荐岗位】{company} - {title}{loc_note}")
     lines.append(
         f"【匹配分】基础适配分 {match_score} ＋ 偏好加分 {direction_bonus + commute_bonus}"
         f"（方向 {direction_bonus} / 通勤 {commute_bonus}）＝ 最终推荐分 {rank_score} 分"

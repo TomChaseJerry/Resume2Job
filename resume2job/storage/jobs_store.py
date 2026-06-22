@@ -2,13 +2,15 @@
 """jobs 表统一读写（SQLite = 岗位数据的单一事实源）。
 
 架构约定（标准「关系库做事实源、向量库做索引」分层）：
-    - SQLite jobs 表存岗位的**全部**业务数据：原文、完整结构化画像
-      （jd_profile_json）、检索文本（index_text）、可过滤字段、哈希、来源；
-    - Chroma 只存 embedding + job_id + 少量可过滤标量（city / direction /
-      education_level，pre-filter 必须发生在向量库内部，属正常反规范化投影）；
+    - SQLite jobs 表存岗位的**全部**业务数据：原文、完整结构化画像（jd_profile_json）、
+      检索文本（index_text）、哈希、来源，以及**硬约束召回前预筛派生列**
+      （cities_json / job_types_json / min_degree_rank / city_status / education_status，
+      由 jd_parser.derive_constraint_fields 入库时算好，供 get_eligible_jobs 资格预筛）；
+    - Chroma 只存 embedding + job_id + 少量展示标量（city / direction / education_level）；
+      **硬约束不在 Chroma 里 pre-filter**——召回前先用 SQLite eligibility 预筛得 allowed_job_ids，
+      再用 Chroma where job_id $in 限定检索范围（BM25 通道用同一 id 集合过滤）；
     - 检索通道只返回 job_id + 分数，结果由本模块批量回填（hydration）；
-    - 换 embedding 模型 = 从 SQLite 重建 Chroma（scripts/rebuild_index.py），
-      零解析成本。
+    - 换 embedding 模型 = 从 SQLite 重建 Chroma（scripts/rebuild_index.py），零解析成本。
 
 所有写入方（批量建库 retrieval/indexer、运行时 storage/jd_ingest）必须经由
 upsert_job 写入，禁止旁路写 jobs 表。
@@ -272,12 +274,36 @@ def all_jobs_for_index() -> List[dict]:
 
 
 def count() -> int:
-    """jobs 表总行数（BM25 缓存键等轻量用途）。"""
+    """jobs 表总行数（轻量用途）。"""
     try:
         with _conn() as conn:
             return conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
     except Exception:
         return 0
+
+
+def corpus_signature() -> str:
+    """可检索语料的轻量内容签名：对所有 index_text 非空岗位的 (job_id, jd_hash) 有序哈希。
+
+    供 BM25 缓存键用，**替代 count()**——岗位内容**原地更新**（条数不变、jd_hash 变了）也能触发
+    重建，避免「BM25 看旧 JD、dense 看新 JD」的双通道陈旧。百级语料每次召回算一次 MD5，开销可忽略。
+    失败返回空串（调用方退化为「每次都重建」，不会用错语料）。
+    """
+    try:
+        with _conn() as conn:
+            rows = conn.execute(
+                "SELECT job_id, jd_hash FROM jobs WHERE index_text != '' ORDER BY job_id"
+            ).fetchall()
+        h = hashlib.md5()
+        for r in rows:
+            h.update((r["job_id"] or "").encode("utf-8"))
+            h.update(b"\x00")
+            h.update((r["jd_hash"] or "").encode("utf-8"))
+            h.update(b"\x01")
+        return h.hexdigest()
+    except Exception as e:
+        print(f"[jobs_store] 警告：计算语料签名失败：{e}")
+        return ""
 
 
 def all_jobs_min() -> List[dict]:

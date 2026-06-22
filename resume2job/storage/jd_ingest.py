@@ -16,7 +16,8 @@ JD 自动入库模块（LangGraph 节点，挂在 jd_input 之后）。
 
 存储分层（与 retrieval/indexer 一致，见 storage/jobs_store.py 模块说明）：
     - SQLite：jd_text / jd_profile_json / index_text / 全部业务字段；
-    - Chroma：embedding + document(index_text) + {city, direction, education_level} 等过滤标量。
+    - Chroma：embedding + document(index_text) + {job_id, city, direction, education_level} 展示标量
+      （硬约束改 SQLite eligibility 召回前预筛 allowed_job_ids，不再靠 Chroma 标量做 pre-filter）。
 """
 
 import os

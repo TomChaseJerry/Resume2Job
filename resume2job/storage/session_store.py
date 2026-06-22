@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """会话短期状态存储（session_state）。
 
-存「上一轮结果摘要 last_results、活跃约束、活跃 resume/jd 引用」等跨轮短期状态，
-让多轮指代（『第二个』『换上海』）能基于结构化上下文稳定解析，而非把整段对话塞 prompt。
+存「上一轮展示摘要 last_results、完整候选池 candidate_pool、已展示 shown_job_ids、
+活跃硬约束 active_hard_constraints / 活跃方向偏好 active_direction_tags」等跨轮短期状态，
+供下一轮换一批/重排复用候选池、SELECTED/ASSIST 按明确 job_id 读详情，而非把整段对话塞 prompt。
 
 三级回退（按可用性自动降级，保证无 Redis 的开发机照常跑）：
     1. Redis（生产首选，带 TTL）——import / 连接失败则降级；

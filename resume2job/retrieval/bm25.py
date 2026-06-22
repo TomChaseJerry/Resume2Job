@@ -6,10 +6,11 @@
     - BM25 通道擅长精确关键词命中（「LangGraph」「RLHF」这类低频专有名词），
       不受 embedding 语义平滑稀释。
 
-语料来自 SQLite 事实源（jobs 表的 index_text，与向量通道入库的是同一份文本），
-过滤字段（city / direction / education_level）也取自 SQLite，保证两个通道的
-可比性与过滤一致性；SQLite 无可用语料时回退到 Chroma documents（兼容未迁移的旧库）。
-岗位库规模小（百级以内），全量构建内存索引即可；按 jobs 表行数做轻量缓存。
+语料来自 SQLite 事实源（jobs 表的 index_text，与向量通道入库的是同一份文本）；
+SQLite 无可用语料时回退到 Chroma documents（兼容未迁移的旧库）。硬约束（城市/学历/类型）
+在召回前由 SQLite eligibility 预筛得 allowed_job_ids，BM25 search 用该集合过滤（与向量通道一致）。
+岗位库规模小（百级以内），全量构建内存索引即可；按**语料内容签名**（corpus_signature，
+基于各岗位 jd_hash）做轻量缓存——岗位原地更新（条数不变、内容变了）也能触发重建。
 
 BM25 命中不携带 jd_profile —— 与向量通道一致，由 retriever 在融合后统一从
 SQLite 批量回填（hydration）。
@@ -121,16 +122,16 @@ _CACHE: dict = {}
 
 
 def get_bm25_corpus(collection=None) -> BM25Corpus:
-    """获取（必要时构建）BM25 索引；以来源 + 条数为缓存键。
+    """获取（必要时构建）BM25 索引；以来源 + **语料内容签名**为缓存键。
 
     首选 SQLite 事实源；其 index_text 为空（旧库未迁移）且提供了 collection 时
-    回退到 Chroma documents。岗位库追加新 JD 后条数变化，自动触发重建；
-    百级语料重建开销可忽略。
+    回退到 Chroma documents。缓存键用 jobs_store.corpus_signature()（基于各岗位 jd_hash）：
+    追加新 JD **或原地改 JD 内容**都会改变签名、自动触发重建；百级语料重建开销可忽略。
     """
     from resume2job.storage import jobs_store
 
-    n = jobs_store.count()
-    key = ("sqlite", jobs_store.DB_PATH, n)
+    sig = jobs_store.corpus_signature()
+    key = ("sqlite", jobs_store.DB_PATH, sig)
     if key not in _CACHE:
         corpus = BM25Corpus.from_jobs_store()
         if not corpus.ids and collection is not None:

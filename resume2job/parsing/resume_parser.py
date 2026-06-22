@@ -29,9 +29,10 @@ JSON_SCHEMA_EXAMPLE = {
         "email": "string or null",
         "phone": "string or null",
         "github": "string or null",
-        "Birthplace": "string or null",
+        "homepage": "string or null",
         "other": ["string"]
     },
+    "current_location": "string or null（候选人当前所在城市，用于检索/通勤兜底）",
     "educations": [
         {
             "school": "string",
@@ -135,7 +136,8 @@ SYSTEM_PROMPT = """你是一名专业的简历信息抽取助手，擅长从中�
 - projects.evidence：必须**来自简历原文**，优先保留可量化成果（如「准确率提升 5%」「日活 10w+」「QPS 提升 3 倍」）；当原文确实没有量化数字时，保留能证明能力的原文描述句（如「独立完成模型部署上线」），但不要复述 description。
 - achievements 与 evidence 的区别：achievements 是简洁的成果点；evidence 是原文佐证句，可以更长。
 - publications.role：一作 / 共一 / 通讯 / 参与，无法判断则 null。
-- job_preferences.intentions：抽取明确的求职方向；若简历未写求职意向，则结合最近的实习 / 项目方向合理推断 1~3 个标签，并在 extraction_meta.warnings 中注明「intentions 由经验推断」。
+- job_preferences.intentions：**仅**抽取简历中**明确表达**的求职意向 / 求职方向（如「求职意向：大模型算法」「期望岗位：推荐算法」）；
+  简历未明确写出求职意向时保持为空列表 []，**禁止**根据课程、技能或项目经历推断求职偏好。
 - 日期统一格式 YYYY-MM；正在进行中的写「至今」。
 
 【输出】
@@ -167,6 +169,23 @@ DEFAULT_PROFILE = {
     },
     "extraction_meta": {"source_file": None, "model": None, "extracted_at": None, "warnings": []},
 }
+
+
+# ===== 解析失败结构（与「成功画像」「字段缺失但解析成功」可区分）=====
+# 成功 -> 返回完整画像 dict（无 error 键）；失败 -> 返回带 error/error_stage 的轻量 dict。
+# error_stage ∈ {pdf_empty(PDF无文本) / llm_failed(模型调用异常) / parse_failed(输出非合法JSON)}。
+def parse_error(stage: str, reason: str, source_file: Optional[str] = None) -> dict:
+    """构造可区分的解析失败结果（区别于「成功但字段缺失」的空列表/null）。"""
+    return {
+        "error": reason,
+        "error_stage": stage,
+        "extraction_meta": {
+            "source_file": source_file,
+            "model": MODEL_NAME,
+            "extracted_at": datetime.now(timezone.utc).isoformat(),
+            "warnings": [],
+        },
+    }
 
 
 # ===== PDF 文本提取 =====
@@ -270,12 +289,24 @@ def validate_resume_profile(profile: dict, source_file: Optional[str] = None) ->
 
 # ===== 主流程 =====
 def parse_resume(pdf_path: str) -> dict:
-    """主流程：PDF -> 文本 -> LLM -> JSON -> 校验。解析失败返回空字典。"""
-    # 步骤 1：从 PDF 提取全文
-    resume_text = extract_pdf_text(pdf_path)
+    """主流程：PDF -> 文本 -> LLM -> JSON -> 校验。
+
+    返回值可区分三种情况（见 parse_error）：
+      - 成功：完整画像 dict（含 extraction_meta，无 error 键）；字段缺失体现为空列表/null，仍属成功；
+      - PDF 无文本（pdf_empty）/ LLM 调用失败（llm_failed）/ 输出非合法 JSON（parse_failed）：
+        返回带 error + error_stage 的失败结构，调用方据此给出精确反馈，不与「成功但字段缺失」混淆。
+    """
+    source_file = os.path.basename(pdf_path)
+
+    # 步骤 1：从 PDF 提取全文（读取异常单列 pdf_unreadable，与「能读但无文本」区分）
+    try:
+        resume_text = extract_pdf_text(pdf_path)
+    except Exception as e:
+        print(f"[ERROR] PDF 读取失败：{e}")
+        return parse_error("pdf_unreadable", f"PDF 读取失败（文件不存在 / 损坏 / 非 PDF）：{e}", source_file)
     if not resume_text:
-        print("[ERROR] PDF 文本为空，无法解析")
-        return {}
+        print("[ERROR] PDF 文本为空，无法解析（可能为扫描件 / 图片型 PDF / 空文件）")
+        return parse_error("pdf_empty", "PDF 未提取到文本（可能为扫描件、图片型 PDF 或空文件）", source_file)
 
     # 步骤 2：构造 Prompt
     user_prompt = build_user_prompt(resume_text)
@@ -285,15 +316,16 @@ def parse_resume(pdf_path: str) -> dict:
         raw_output = call_llm(SYSTEM_PROMPT, user_prompt)
     except Exception as e:
         print(f"[ERROR] LLM 调用失败：{e}")
-        return {}
+        return parse_error("llm_failed", f"简历解析模型调用失败：{e}", source_file)
 
     # 步骤 4：解析 JSON
     parsed = safe_json_parse(raw_output)
     if parsed is None:
-        return {}
+        print("[ERROR] LLM 输出无法解析为合法 JSON")
+        return parse_error("parse_failed", "简历解析模型输出无法解析为合法 JSON", source_file)
 
-    # 步骤 5：结构校验与补默认值
-    return validate_resume_profile(parsed, source_file=os.path.basename(pdf_path))
+    # 步骤 5：结构校验与补默认值（成功）
+    return validate_resume_profile(parsed, source_file=source_file)
 
 
 def main():

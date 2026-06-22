@@ -15,6 +15,7 @@ nodes/executor.py
     6. 返回更新后的 AgentState（浅拷贝，不破坏未负责的字段）。
 """
 
+import re
 import json
 import concurrent.futures
 from typing import Optional
@@ -26,10 +27,14 @@ from resume2job.parsing.resume_parser import parse_resume
 from resume2job.parsing.jd_parser import parse_jd
 from resume2job.retrieval.retriever import retrieve_jobs
 from resume2job.retrieval.indexer import lookup_ingested_jd_profile
-from resume2job.scoring.match_scorer import score_match, calculate_skill_score
-from resume2job.scoring.skill_gap import analyze_skill_gap
-# Stage 4：完整报告优先用 generate_full_report；generate_recommendation 保留作兜底
-from resume2job.generation.recommendation import generate_full_report, generate_recommendation
+from resume2job.scoring.match_scorer import (
+    score_match, compute_direction_bonus, calculate_rank_score, judge_match_level,
+)
+# 合并调用（1 次 LLM 产出 skill_gap + 报告）+ 纯 Python 重组 + 规则兜底完整报告 + 规则兜底 skill_gap
+# （skill_gap 视图 2026-06-21 已并入 recommendation 报告层，不再有独立 scoring/skill_gap 模块）
+from resume2job.generation.recommendation import (
+    generate_report_and_gap, recompose_report, generate_full_report, rule_based_skill_gap,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +133,8 @@ def resume_parser_node(state: AgentState) -> AgentState:
 
     - plan["need_resume_parse"] 为 False -> 跳过；
     - resume_profile 已存在 -> 复用，不重复解析；
-    - pdf_path 为空 -> 记录错误后返回。
+    - pdf_path 为空 -> 静默跳过（多轮 / ASSIST / 复用池等无 PDF 轮次由 profile_cache 加载缓存画像；
+      若确实无任何画像，planner 的澄清机制已在更早拦截，不在此处报错制造噪音）。
     """
     print("[resume_parser_node] 开始执行...")
 
@@ -142,13 +148,19 @@ def resume_parser_node(state: AgentState) -> AgentState:
 
     pdf_path = state.get("pdf_path")
     if not pdf_path:
-        return append_error(state, "resume_parser_node: 缺少 pdf_path，无法解析简历")
+        # 本轮没传 PDF：交给下游 profile_cache 复用缓存画像（无缓存的「无简历推荐」已被澄清拦截）
+        print("[resume_parser_node] 本轮无 PDF，跳过解析（由 profile_cache 复用缓存画像）")
+        return state
 
     new_state = dict(state)
     try:
         resume_profile = parse_resume(pdf_path)
-        if not resume_profile:
-            return append_error(state, "resume_parser_node: 简历解析结果为空，解析失败")
+        # 解析失败可区分（PDF 无文本 / 模型异常 / 输出非 JSON）：给出精确反馈，不与「成功但字段缺失」混淆
+        if not resume_profile or (isinstance(resume_profile, dict) and resume_profile.get("error")):
+            reason = resume_profile.get("error") if isinstance(resume_profile, dict) and resume_profile.get("error") \
+                else "简历解析结果为空"
+            stage = resume_profile.get("error_stage") if isinstance(resume_profile, dict) else None
+            return append_error(state, f"resume_parser_node: 简历解析失败[{stage or 'unknown'}]：{reason}")
         new_state["resume_profile"] = resume_profile
         print("[resume_parser_node] 简历解析完成")
     except Exception as exc:
@@ -181,8 +193,12 @@ def job_retriever_node(state: AgentState) -> AgentState:
     config = state.get("retrieval_config") or {}
     top_k = config.get("top_k", 5)
     city_filter = config.get("city_filter")
-    direction_filter = config.get("direction_filter")
-    education_filter = config.get("education_filter")
+    job_type_filter = config.get("job_type_filter") or "实习"  # 岗位类型硬约束，默认实习
+    # 候选人学历 → rank（本1硕2博3）供召回前学历资格预筛：优先 retrieval_config.education_filter
+    # （planner 显式约束），否则取简历 highest_degree；无法识别 → None（学历不卡）。
+    from resume2job.parsing.jd_parser import DEGREE_RANK
+    edu_str = str(config.get("education_filter") or resume_profile.get("highest_degree") or "").strip()
+    user_degree_rank = DEGREE_RANK.get(edu_str)
 
     new_state = dict(state)
     try:
@@ -190,26 +206,26 @@ def job_retriever_node(state: AgentState) -> AgentState:
             resume_profile=resume_profile,
             top_k=top_k,
             city_filter=city_filter,
-            direction_filter=direction_filter,
-            education_filter=education_filter,
+            user_degree_rank=user_degree_rank,
+            job_type_filter=job_type_filter,
+            preferences=state.get("preference_tags") or None,  # 方向偏好仅助召回（Query3），排序走评分层
         )
         candidate_jobs = candidate_jobs or []
 
-        # 城市是用户显式硬约束：该城市召回为零（检索级联已保证绝不拿别的城市凑数）
-        # 时提前终止——清空候选、写 final_response 告知并询问是否放宽，下游评分节点
-        # 自然跳过，不对用户不要的城市浪费任何 LLM 评分调用。用户下一轮回复
-        # 「不限城市」即可走正常推荐（对话历史让 planner 能理解该追问）。
-        # 城市硬约束已在 retrieve_jobs 内做 post-filter（基于多城市 cities）：
-        # 指定了城市却召回为空，即知识库无该城市岗位 -> 提前终止，避免浪费评分调用。
+        # 城市 / 岗位类型是用户显式硬约束：该约束下召回为零（检索 post-filter 已保证绝不拿
+        # 别的城市/类型凑数）时提前终止——清空候选、写 final_response 告知并询问是否放宽，
+        # 下游评分节点自然跳过，不浪费任何 LLM 评分调用。用户下一轮回复「不限城市」等即可恢复。
         from resume2job.parsing.jd_parser import normalize_city
         want_city = normalize_city(city_filter)
-        if want_city and not candidate_jobs:
+        want_jt = (str(job_type_filter).strip() if job_type_filter else "")
+        if (want_city or want_jt) and not candidate_jobs:
+            cond = "、".join(x for x in (want_city, (f"{want_jt}岗位" if want_jt else "")) if x) or "当前条件"
             new_state["candidate_jobs"] = []
             new_state["final_response"] = (
-                f"知识库暂无「{want_city}」的实习岗位，本轮未做推荐。"
-                f"要不要看看不限城市的岗位？回复「不限城市」即可。"
+                f"知识库暂无满足「{cond}」的岗位，本轮未做推荐。"
+                f"要不要放宽城市或岗位类型？回复「不限城市」或换一种岗位类型即可。"
             )
-            print(f"[job_retriever_node] 城市「{want_city}」无岗位，提前终止推荐链路。")
+            print(f"[job_retriever_node] 「{cond}」无岗位，提前终止推荐链路。")
             return new_state
 
         new_state["candidate_jobs"] = candidate_jobs
@@ -257,8 +273,12 @@ def jd_input_node(state: AgentState) -> AgentState:
 
     try:
         jd_profile = parse_jd(jd_text)
-        if not jd_profile:
-            return append_error(state, "jd_input_node: JD 解析结果为空，解析失败")
+        # 解析失败可区分（JD 空 / 模型异常 / 输出非 JSON）：给出精确反馈
+        if not jd_profile or (isinstance(jd_profile, dict) and jd_profile.get("error")):
+            reason = jd_profile.get("error") if isinstance(jd_profile, dict) and jd_profile.get("error") \
+                else "JD 解析结果为空"
+            stage = jd_profile.get("error_stage") if isinstance(jd_profile, dict) else None
+            return append_error(state, f"jd_input_node: JD 解析失败[{stage or 'unknown'}]：{reason}")
         new_state["jd_profiles"] = [jd_profile]
         print("[jd_input_node] JD 解析完成，写入 jd_profiles")
     except Exception as exc:
@@ -329,116 +349,176 @@ def jd_analyzer_node(state: AgentState) -> AgentState:
 # 节点 5：match_scorer_node
 # ---------------------------------------------------------------------------
 
-def _safe_skill_gap(resume_profile: dict, jd_profile: dict, match_score: dict,
-                    job_id: str, errors: list) -> dict:
-    """调用 analyze_skill_gap；失败时返回带 error 的空 skill_gap，不中断岗位。"""
+def _score_one_job(resume_profile: dict, jd_profile: dict, job_id: str,
+                   errors: list, user_direction_tags=None):
+    """只评分（score_match：project 一次 LLM + 规则）→ match_score，供候选池排序。
+    **不**生成 skill_gap / 报告（那是展示岗位才做的惰性叙述）。失败返回 None。"""
     try:
-        skill_gap = analyze_skill_gap(
-            resume_profile=resume_profile,
-            jd_profile=jd_profile,
-            match_result=match_score,
-        )
-        if isinstance(skill_gap, dict):
-            return skill_gap
-        errors.append(f"match_scorer_node: 岗位 {job_id} 的 skill_gap 返回非法类型，已置空")
+        return score_match(resume_profile, jd_profile, user_direction_tags)
     except Exception as exc:
-        errors.append(f"match_scorer_node: 岗位 {job_id} 技能差距分析失败：{exc}")
-    # 兜底：结构与 analyze_skill_gap 一致的空 skill_gap
-    return {
-        "items": [],
-        "matched_skills": [],
-        "weak_skills": [],
-        "missing_skills": [],
-        "overall_risk": "low",
-        "overall_risk_reason": "技能差距分析未能产出结果。",
-        "top_suggestion": "建议正常投递，并在简历中突出相关项目证据。",
-        "error": f"skill_gap 生成失败（岗位 {job_id}）",
-    }
+        errors.append(f"match_scorer_node: 岗位 {job_id} 评分失败：{exc}")
+        return None
 
 
-def _safe_full_report(jd_profile: dict, match_score: dict, skill_gap: dict,
-                      job_id: str, errors: list) -> str:
-    """生成完整报告；generate_full_report 失败时回退到 generate_recommendation。"""
-    try:
-        return generate_full_report(jd_profile, match_score, skill_gap)
-    except Exception as exc:
-        errors.append(
-            f"match_scorer_node: 岗位 {job_id} generate_full_report 失败：{exc}，回退旧版报告"
-        )
-    try:
-        return generate_recommendation(jd_profile, match_score, skill_gap)
-    except Exception as exc2:
-        errors.append(f"match_scorer_node: 岗位 {job_id} generate_recommendation 也失败：{exc2}")
-        return ""
+def _ensure_narrated(mr: dict, resume_profile: dict, errors: list) -> dict:
+    """惰性生成「展示岗位」的 skill_gap + 报告（合并为一次 LLM）：
 
-
-def _evaluate_one_job(resume_profile: dict, jd_profile: dict, job_id: str,
-                      errors: list) -> tuple:
-    """对单个岗位完成「评分 + 技能差距 + 报告」，并发独立的 LLM 调用以降低串行延迟。
-
-    依赖关系：
-        - score_match 内部的 project_score / direction_score 已并发；
-        - skill_gap 只依赖规则计算的 skill_score（与评分 LLM 无依赖），
-          因此把它和 score_match 一起并发，三路 LLM 同时跑；
-        - report 依赖评分与 skill_gap 的全部结果，最后串行生成。
-
-    返回 (match_score, skill_gap, report)；score_match 失败时返回 (None, None, None)
-    并已把错误写入 errors（该岗位由调用方跳过）。
+    - 未叙述过（无 _writer 缓存）→ generate_report_and_gap（1 次 LLM 产出 items+reason+suggestion），
+      缓存 skill_gap / _writer / report；
+    - 已叙述（有 _writer）→ 用缓存 reason/suggestion + 当前 match_score 纯 Python 重组报告
+      （换一批/重排后 rank_score 已变，重组刷新分数行，**不再调 LLM**）。
     """
-    # skill_gap 只读 match_result["skill_score"]，这里先用规则算好喂给它，
-    # 使其无需等待 score_match 完成即可并发启动。skill_score 为确定性规则计算，
-    # 与 score_match 内部重算结果一致，故 skill_gap 输出不变。
-    skill_score_pre = calculate_skill_score(resume_profile, jd_profile)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-        f_match = ex.submit(score_match, resume_profile, jd_profile)
-        f_gap = ex.submit(
-            _safe_skill_gap, resume_profile, jd_profile,
-            {"skill_score": skill_score_pre}, job_id, errors,
-        )
+    if not isinstance(mr, dict):
+        return mr
+    jd = mr.get("jd_profile") or {}
+    ms = mr.get("match_score") or {}
+    job_id = mr.get("job_id")
+    if mr.get("_writer"):
+        old_report = mr.get("report") or ""
+        new_report = recompose_report(jd, ms, mr.get("skill_gap"), mr["_writer"])
+        # 保留上一轮 _run_commute 追加的【通勤】尾段（从 narrative 重组会丢掉它），刷新分数行的同时不丢通勤信息
+        m = re.search(r"\n*【通勤】.*$", old_report, re.DOTALL)
+        if m and "【通勤】" not in new_report:
+            new_report = new_report.rstrip() + "\n\n" + m.group(0).strip()
+        mr["report"] = new_report
+        return mr
+    try:
+        report, skill_gap, writer_out = generate_report_and_gap(resume_profile, jd, ms)
+        mr["skill_gap"] = skill_gap
+        mr["_writer"] = writer_out
+        mr["report"] = report
+    except Exception as exc:
+        errors.append(f"match_scorer_node: 岗位 {job_id} 报告生成失败：{exc}，规则兜底")
         try:
-            match_score = f_match.result()
-        except Exception as exc:
-            errors.append(f"match_scorer_node: 岗位 {job_id} 评分失败：{exc}")
-            f_gap.result()  # 回收已提交的 skill_gap（其异常已被 _safe_skill_gap 自行处理）
-            return None, None, None
-        skill_gap = f_gap.result()
+            skill_gap = rule_based_skill_gap(jd, ms)
+            mr["skill_gap"] = skill_gap
+            mr["_writer"] = {"reason": "", "suggestion": ""}
+            mr["report"] = generate_full_report(jd, ms, skill_gap)
+        except Exception as exc2:  # 兜底也异常（极端畸形 JD）：给最小可用结果，绝不让单岗中断整批
+            errors.append(f"match_scorer_node: 岗位 {job_id} 规则兜底也失败：{exc2}")
+            mr["skill_gap"] = {}
+            mr["_writer"] = {"reason": "", "suggestion": ""}
+            mr["report"] = (f"【推荐岗位】{jd.get('company') or '未知公司'} - {jd.get('title') or '未知岗位'}\n"
+                            f"（本岗位报告生成失败）")
+    return mr
 
-    # 完整报告（full_report 失败回退旧版）——依赖前两步结果，串行
-    report = _safe_full_report(jd_profile, match_score, skill_gap, job_id, errors)
-    return match_score, skill_gap, report
 
+def _narrate_batch(batch: list, resume_profile: dict, errors: list) -> None:
+    """对一批展示岗位并发惰性叙述（已缓存的只重组报告，新岗位才调 LLM）。
 
-def _evaluate_skill_gap_only(resume_profile: dict, jd_profile: dict, job_id: str,
-                             errors: list) -> dict:
-    """skill_gap_only 场景：只做技能差距分析，不评分、不生成推荐报告。
-
-    skill_gap 仅依赖规则计算的 skill_score（calculate_skill_score，确定性、无 LLM），
-    因此无需调用 score_match，省下评分与报告两次 LLM，使该任务明显更轻。
+    单岗叙述异常被隔离（_ensure_narrated 内已兜底；这里再兜一层），不让任一岗位失败中断整批。
     """
-    skill_score_pre = calculate_skill_score(resume_profile, jd_profile)
-    return _safe_skill_gap(
-        resume_profile, jd_profile, {"skill_score": skill_score_pre}, job_id, errors,
-    )
+    if not batch:
+        return
+    workers = min(8, len(batch))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = [ex.submit(_ensure_narrated, mr, resume_profile, errors) for mr in batch]
+        for fut in concurrent.futures.as_completed(futs):
+            try:
+                fut.result()
+            except Exception as exc:
+                errors.append(f"_narrate_batch: 岗位叙述异常（已隔离）：{exc}")
+
+
+def _display_k(state: AgentState) -> int:
+    """本轮展示岗位数（用户请求数）；候选池可比它大，供换一批/重排复用。"""
+    cfg = state.get("retrieval_config") or {}
+    return max(1, int(cfg.get("display_k") or cfg.get("top_k") or 5))
+
+
+def _serve_next_batch(state: AgentState) -> AgentState:
+    """NEXT_BATCH：从候选池取下一批未展示岗位（已评分，不重新评分）。"""
+    print("[match_scorer_node] 复用候选池：取下一批未展示岗位")
+    pool = state.get("candidate_pool") or []
+    shown = set(state.get("shown_job_ids") or [])
+    display_k = _display_k(state)
+    unshown = [r for r in pool if isinstance(r, dict) and r.get("job_id") not in shown]
+    new_state = dict(state)
+    if not unshown:
+        new_state["match_results"] = []
+        new_state["final_response"] = (
+            "当前候选岗位已全部展示完。可以修改城市、岗位类型或方向偏好后再搜索，我再为你召回一批。"
+        )
+        print("[match_scorer_node] 候选池已无更多未展示岗位。")
+        return new_state
+    batch = unshown[:display_k]
+    errors = list(state.get("errors") or [])
+    _narrate_batch(batch, state.get("resume_profile") or {}, errors)  # 惰性叙述新展示岗位
+    new_state["candidate_pool"] = pool  # 池项被就地写入叙述缓存，整池回存
+    new_state["match_results"] = batch
+    new_state["shown_job_ids"] = list(shown | {r.get("job_id") for r in batch})
+    new_state["skill_gaps"] = [{"job_id": r.get("job_id"),
+                                "company": (r.get("jd_profile") or {}).get("company"),
+                                "title": (r.get("jd_profile") or {}).get("title"),
+                                **(r.get("skill_gap") or {})} for r in batch]
+    new_state["errors"] = errors
+    print(f"[match_scorer_node] 下一批 {len(batch)} 个岗位（池剩余未展示 {len(unshown) - len(batch)}）。")
+    return new_state
+
+
+def _rerank_pool(state: AgentState) -> AgentState:
+    """REUSE_RERANK：复用候选池，仅按新方向偏好重算 direction_bonus + rank_score 并重排（不重评分）。
+
+    重排后只对展示 Top-N 惰性叙述：已叙述的纯 Python 重组报告刷新分数行，新进 Top-N 的才调一次合并 LLM。
+    """
+    print("[match_scorer_node] 复用候选池：重算方向偏好分并重排")
+    pool = list(state.get("candidate_pool") or [])
+    display_k = _display_k(state)
+    user_direction_tags = list((state.get("preference_tags") or {}).keys())
+    for r in pool:
+        if not isinstance(r, dict):
+            continue
+        ms = dict(r.get("match_score") or {})
+        info = compute_direction_bonus(r.get("jd_profile") or {}, user_direction_tags)
+        ms["direction_bonus"] = info["bonus"]
+        ms["direction_bonus_info"] = info
+        ms["rank_score"] = calculate_rank_score(
+            ms.get("match_score", 0), info["bonus"], ms.get("commute_bonus", 0.0),
+        )
+        ms["match_level"] = judge_match_level(ms["rank_score"])
+        r["match_score"] = ms
+    pool.sort(key=lambda r: (r.get("match_score") or {}).get("rank_score", 0), reverse=True)
+    batch = pool[:display_k]
+    errors = list(state.get("errors") or [])
+    _narrate_batch(batch, state.get("resume_profile") or {}, errors)  # 缓存→重组报告刷新分数，新岗位→LLM
+    new_state = dict(state)
+    new_state["candidate_pool"] = pool
+    new_state["match_results"] = batch
+    # 已展示岗位累加（不复位）：避免后续换一批重复展示已见岗位
+    new_state["shown_job_ids"] = list(set(state.get("shown_job_ids") or []) | {r.get("job_id") for r in batch})
+    new_state["skill_gaps"] = [{"job_id": r.get("job_id"),
+                                "company": (r.get("jd_profile") or {}).get("company"),
+                                "title": (r.get("jd_profile") or {}).get("title"),
+                                **(r.get("skill_gap") or {})} for r in batch]
+    new_state["errors"] = errors
+    print(f"[match_scorer_node] 复用池重排完成，展示 Top-{len(batch)}。")
+    return new_state
 
 
 def match_scorer_node(state: AgentState) -> AgentState:
-    """
-    对每个岗位执行：匹配评分 -> 技能差距分析 -> 生成完整报告（Stage 4 固定内部链路）。
+    """评分 + 惰性叙述（解析建议：技能差距与报告合并为一次 LLM、且只对展示岗位生成）。
 
-    - score_match 失败：跳过该岗位并记录错误；
-    - analyze_skill_gap 失败：不跳过，生成带 error 的空 skill_gap 继续；
-    - generate_full_report 失败：回退到 generate_recommendation；
-    - 单个岗位失败不会中断其它岗位；
-    - 最终结果按 match_score["final_score"] 降序排序。
+    会话动作分支（item8）：
+      - next_batch：从候选池取下一批未展示岗位，惰性叙述（不重评分）；
+      - reuse_pool（REUSE_RERANK）：复用池仅重算方向偏好分重排，惰性叙述 Top-N（不重评分）；
+      - 否则（RETRIEVE/USER_JD）：① 整池只评分（project 一次 LLM/岗）→ 按 rank_score 排序；
+        ② **只对展示 Top-N 惰性叙述**（一次合并 LLM 产出 skill_gap + 报告），未展示岗位换一批时再叙述。
+
+    单岗评分/叙述失败不中断其它；结果按 rank_score 降序。
     """
     print("[match_scorer_node] 开始执行...")
+
+    # —— 候选池复用分支（不重评分）——
+    if get_plan_flag(state, "next_batch"):
+        return _serve_next_batch(state)
+    if get_plan_flag(state, "reuse_pool") and (state.get("candidate_pool")):
+        return _rerank_pool(state)
 
     need_match = get_plan_flag(state, "need_match_score")
     need_reco = get_plan_flag(state, "need_recommendation")
     need_gap = get_plan_flag(state, "need_skill_gap")
 
-    # 三个开关都为 False -> 跳过
+    # 三个开关都为 False -> 跳过（如 SELECTED/ASSIST：match_results 已由 planner 注入）
     if not need_match and not need_reco and not need_gap:
         return state
 
@@ -455,57 +535,40 @@ def match_scorer_node(state: AgentState) -> AgentState:
 
     new_state = dict(state)
     errors = list(state.get("errors") or [])
-    match_results: list[MatchResult] = []
-    skill_gaps_all: list[dict] = []  # 同步写回 state["skill_gaps"]
+    user_direction_tags = list((state.get("preference_tags") or {}).keys())
 
-    # 需要评分或推荐报告 -> 走完整链路；否则（纯 skill_gap_only）只做技能差距分析
-    full_pipeline = need_match or need_reco
-
-    for idx, jd_profile in enumerate(jd_profiles):
-        job_id = get_job_id(jd_profile, idx)
-
-        if full_pipeline:
-            # 评分 + 技能差距 + 报告：内部已对独立 LLM 调用并发（详见 _evaluate_one_job）
-            match_score, skill_gap, report = _evaluate_one_job(
-                resume_profile, jd_profile, job_id, errors,
-            )
+    # 1) 整池只评分（project 一次 LLM/岗 + 规则）→ match_score，并发跑；不生成 skill_gap/报告
+    pool: list[MatchResult] = []
+    workers = min(8, len(jd_profiles))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {}
+        for idx, jd_profile in enumerate(jd_profiles):
+            job_id = get_job_id(jd_profile, idx)
+            fut = ex.submit(_score_one_job, resume_profile, jd_profile, job_id, errors, user_direction_tags)
+            futs[fut] = (job_id, jd_profile)
+        for fut in concurrent.futures.as_completed(futs):
+            job_id, jd_profile = futs[fut]
+            match_score = fut.result()
             if match_score is None:  # 评分失败 -> 跳过该岗位
                 continue
+            pool.append(MatchResult(job_id=job_id, jd_profile=jd_profile,
+                                    match_score=match_score, skill_gap={}, report=""))
 
-            match_results.append(
-                MatchResult(
-                    job_id=job_id,
-                    jd_profile=jd_profile,
-                    match_score=match_score,
-                    skill_gap=skill_gap,
-                    report=report,
-                )
-            )
-            # 附带 job_id，便于 state["skill_gaps"] 溯源
-            skill_gaps_all.append({"job_id": job_id, **skill_gap})
-        else:
-            # 纯 skill_gap_only：不评分、不出报告，仅产出技能差距分析。
-            # 附带 company/title，供展示层渲染「对照某岗位的能力差距」标题。
-            skill_gap = _evaluate_skill_gap_only(resume_profile, jd_profile, job_id, errors)
-            skill_gaps_all.append({
-                "job_id": job_id,
-                "company": jd_profile.get("company"),
-                "title": jd_profile.get("title"),
-                **skill_gap,
-            })
+    # 2) 按 rank_score 降序排序
+    pool.sort(key=lambda r: (r.get("match_score") or {}).get("rank_score", 0), reverse=True)
 
-    # 按 final_score 降序排序（缺失时按 0 处理）
-    match_results.sort(
-        key=lambda r: (r.get("match_score") or {}).get("final_score", 0),
-        reverse=True,
-    )
+    # 3) 只对展示 Top-N 惰性叙述（一次合并 LLM/岗，产出 skill_gap + 报告）
+    display_k = _display_k(state)
+    shown = pool[:display_k]
+    _narrate_batch(shown, resume_profile, errors)
 
-    new_state["match_results"] = match_results
-    new_state["skill_gaps"] = skill_gaps_all
+    new_state["candidate_pool"] = pool                  # 全量评分候选池（含未叙述）供换一批/重排
+    new_state["match_results"] = shown
+    new_state["shown_job_ids"] = [r.get("job_id") for r in shown]
+    new_state["skill_gaps"] = [{"job_id": r.get("job_id"),
+                                "company": (r.get("jd_profile") or {}).get("company"),
+                                "title": (r.get("jd_profile") or {}).get("title"),
+                                **(r.get("skill_gap") or {})} for r in shown]
     new_state["errors"] = errors
-    if full_pipeline:
-        print(f"[match_scorer_node] 完成评分岗位数量：{len(match_results)}，"
-              f"技能差距分析数量：{len(skill_gaps_all)}")
-    else:
-        print(f"[match_scorer_node] 仅技能差距分析（跳过评分/报告），分析数量：{len(skill_gaps_all)}")
+    print(f"[match_scorer_node] 评分 {len(pool)} 个（候选池），叙述展示 Top-{len(shown)}（合并调用）。")
     return new_state

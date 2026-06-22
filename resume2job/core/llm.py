@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """统一 LLM / Embedding 客户端与 JSON 输出处理工具（单一事实来源）。
 
-此前各业务模块（resume_parser / jd_parser / match_scorer / skill_gap /
-recommendation / learning_plan / interview ...）各自维护一份
-call_llm / clean_llm_json_output / safe_json_parse，本模块将其收敛为一处：
+各业务模块（resume_parser / jd_parser / match_scorer /
+recommendation / learning_plan / interview ...）统一从这里取用：
 
     - call_llm(system, user)       —— 文本补全（OpenAI SDK 兼容，阿里云百炼）
     - get_chat_llm(...)            —— LangChain ChatOpenAI 客户端（供 bind_tools /
@@ -11,7 +10,6 @@ call_llm / clean_llm_json_output / safe_json_parse，本模块将其收敛为一
     - get_embedding(text)          —— text-embedding 向量
     - clean_llm_json_output(raw)   —— 去 Markdown 围栏、截取 JSON 本体
     - safe_json_parse(raw)         —— 清洗 + 解析，失败返回 None
-    - dedup_keep_order(items)      —— 通用保序去重
 """
 
 import os
@@ -148,20 +146,3 @@ def safe_json_parse(raw: str) -> Optional[dict]:
         return None
 
 
-# ---------------------------------------------------------------------------
-# 通用小工具
-# ---------------------------------------------------------------------------
-
-def dedup_keep_order(items: List[Any]) -> List[Any]:
-    """保序去重（大小写不敏感，保留首次出现的原文写法）。"""
-    seen = set()
-    result = []
-    for item in items or []:
-        if item is None:
-            continue
-        key = str(item).strip().lower()
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        result.append(item)
-    return result

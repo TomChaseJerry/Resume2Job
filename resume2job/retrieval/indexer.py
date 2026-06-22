@@ -22,7 +22,7 @@ from typing import Optional
 import chromadb
 
 # 复用已有的 JD 解析器
-from resume2job.parsing.jd_parser import parse_jd
+from resume2job.parsing.jd_parser import parse_jd, derive_constraint_fields, infer_job_type
 # 统一 Embedding（core 层单一事实来源）
 from resume2job.core.llm import get_embedding
 # jobs 表统一读写（SQLite 事实源，与运行时 jd_ingest_node 共用）
@@ -114,7 +114,7 @@ def lookup_ingested_jd_profile(jd_text: str) -> Optional[dict]:
     解析好的同一份 jd_profile，使「单 JD 评估」与「岗位推荐」两条链路看到**完全相同**
     的结构化画像，避免因重复解析产生字段差异导致同一 JD 评分不一致。
 
-    实现：纯 SQLite 查询（jd_hash → jd_profile_json），不再绕道向量库。
+    实现：纯 SQLite 查询（jd_hash → jd_profile_json）。
     未命中或失败返回 None，由调用方回退到实时 parse_jd。
     """
     if not isinstance(jd_text, str) or not jd_text.strip():
@@ -143,7 +143,25 @@ def upsert_job_record(job_id: str, jd_text: str, jd_profile: dict,
         "requirements": jd_profile.get("responsibilities") or [],
         "skills": skills,
         "source": source,
+        # 硬约束预过滤列（cities_json/job_types_json/min_degree_rank/city_status/education_status）
+        **derive_constraint_fields(jd_profile),
     })
+
+
+# ===== 硬约束预过滤列回填（旧库 ALTER 补列后跑一次，从 jd_profile 重算，纯 SQLite）=====
+def backfill_constraint_fields() -> int:
+    """为已入库岗位回填硬约束预过滤列（cities_json/job_types_json/min_degree_rank/city_status/
+    education_status）。用 jd_text 在**内存**里重判 job_type（修旧「全职」等非三桶值），只写约束列、
+    **不回写 jd_profile**（派生分类不持久化回事实源，避免污染 LLM 原始抽取）。返回条数。"""
+    rows = jobs_store.all_jobs_min()
+    n = 0
+    for r in rows:
+        prof = dict(r["jd_profile"])                       # 副本，不动原画像
+        infer_job_type(prof, r.get("jd_text") or "")       # 内存重判（全职先查校招届再归社招，不持久化）
+        jobs_store.update_constraint_fields(r["job_id"], **derive_constraint_fields(prof))
+        n += 1
+    print(f"[indexer] 硬约束预过滤列回填完成：{n} 条")
+    return n
 
 
 # ===== job_id 查重 =====
@@ -212,8 +230,11 @@ def index_jobs(jd_folder: str, db_path: str = DEFAULT_DB_PATH,
                 print(f"[ERROR] 解析失败：{fname}，原因：{e}")
                 fail_count += 1
                 continue
-            if not isinstance(jd_profile, dict) or not jd_profile:
-                print(f"[ERROR] 解析失败：{fname}")
+            # 解析失败可区分（空文本 / 模型异常 / 输出非 JSON）：打印具体原因，不静默
+            if not isinstance(jd_profile, dict) or not jd_profile or jd_profile.get("error"):
+                reason = jd_profile.get("error") if isinstance(jd_profile, dict) and jd_profile.get("error") \
+                    else "结果为空"
+                print(f"[ERROR] 解析失败：{fname}（{reason}）")
                 fail_count += 1
                 continue
 

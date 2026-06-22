@@ -26,7 +26,8 @@ import chromadb
 from resume2job.agent.state import AgentState
 from resume2job.storage.paths import CHROMA_DIR, COLLECTION_NAME
 from resume2job.storage import jobs_store
-from resume2job.storage.jobs_store import compute_jd_hash  # 向后兼容 re-export
+from resume2job.storage.jobs_store import compute_jd_hash
+from resume2job.parsing.jd_parser import derive_constraint_fields  # 硬约束预过滤列派生
 
 # 语义去重阈值（归一化向量下 cosine = 1 - L2²/2）
 SIMILARITY_THRESHOLD = 0.92
@@ -181,6 +182,8 @@ def jd_ingest_node(state: AgentState) -> AgentState:
             "requirements": jd_profile.get("responsibilities") or [],
             "skills": skills,
             "source": "user_uploaded",
+            # 硬约束预过滤列（cities_json/job_types_json/min_degree_rank/city_status/education_status）
+            **derive_constraint_fields(jd_profile),
         })
     except Exception as e:
         print(f"[jd_ingest] 错误：写入 SQLite 失败：{e}")

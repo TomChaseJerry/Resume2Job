@@ -40,9 +40,10 @@ except Exception:
 RESUME_PDF = os.path.join("Resumes", "resume_test_1.pdf")
 JD_EVAL_FILE = os.path.join("JDs", "jd_test_5.txt")
 ACCEPT_DIR = os.path.join("tmp", "acceptance_data")
+TRACE_DIR = os.path.join(ACCEPT_DIR, "traces")
 REPORT_PATH = os.path.join("docs", "acceptance_report.md")
 
-# 场景结果收集：[(编号, 名称, 是否通过, 明细, 耗时秒, [(断言描述, 是否通过)])]
+# 场景结果收集：[(编号, 名称, 是否通过, 明细, 耗时秒, [(断言描述, 是否通过)], [TurnTrace])]
 _RESULTS = []
 
 
@@ -52,21 +53,54 @@ def _read_text(path: str) -> str:
 
 
 class Checker:
-    """逐条记录断言（供报告输出）；失败即抛 AssertionError 中止当前场景。"""
+    """逐条记录断言（供报告输出）；失败即抛 AssertionError 中止当前场景。
+
+    两类断言：
+        - expect(cond, desc)            ：对最终 State 的断言（验输出结构 / 终态正确）；
+        - at(node, predicate, desc)     ：对某节点 trace 快照的断言（把"结果不对"定位到"哪个节点开始偏"）。
+    at 依赖 bind() 关联的 TurnTrace；多轮场景可在每轮后重新 bind 当轮 trace。
+    """
 
     def __init__(self):
-        self.items = []  # [(描述, bool)]
+        self.items = []   # [(描述, bool)]
+        self.trace = None  # 当前关联的 TurnTrace（供 at 查询节点快照）
+
+    def bind(self, trace):
+        """关联当前轮的 trace，返回它本身（便于 `tr = c.bind(run_turn_traced(...))` 写法）。"""
+        self.trace = trace
+        return trace
 
     def expect(self, cond: bool, desc: str):
         self.items.append((desc, bool(cond)))
         if not cond:
             raise AssertionError(desc)
 
+    def at(self, node: str, predicate, desc: str):
+        """对 node 执行后的关键信号快照断言；node 未执行或谓词为假 -> FAIL（带节点名）。"""
+        snap = self.trace.summary_at(node) if self.trace else None
+        try:
+            ok = snap is not None and bool(predicate(snap))
+        except Exception:
+            ok = False
+        full = f"[{node}] {desc}"
+        self.items.append((full, ok))
+        if not ok:
+            raise AssertionError(full)
 
-def _record(no: int, name: str, ok: bool, detail: str, elapsed: float, checks: list) -> None:
-    _RESULTS.append((no, name, ok, detail, elapsed, checks))
+
+def _record(no: int, name: str, ok: bool, detail: str, elapsed: float,
+            checks: list, traces: list) -> None:
+    _RESULTS.append((no, name, ok, detail, elapsed, checks, traces))
+    # 链路 trace 落盘，失败可单独复盘
+    for tr in traces or []:
+        try:
+            tr.dump_json(os.path.join(TRACE_DIR, tr.trace_id.replace("#", "_t") + ".json"))
+        except Exception as e:
+            print(f"[警告] trace 落盘失败（{getattr(tr, 'trace_id', '?')}）：{e}")
     flag = "PASS" if ok else "FAIL"
     print(f"\n[{flag}] S{no} {name}（{elapsed:.1f}s）" + (f" — {detail}" if detail else ""))
+    if traces:
+        print("        路径：" + "  |  ".join(" → ".join(tr.nodes()) for tr in traces))
 
 
 def setup_env():
@@ -104,83 +138,113 @@ def setup_env():
 # ---------------------------------------------------------------------------
 # 场景实现
 # ---------------------------------------------------------------------------
-def scenario_1_job_recommendation(app, run_turn, ctx):
+def scenario_1_job_recommendation(app, run_turn_traced, ctx):
     """S1：上传简历 + 「推荐北京的大模型实习岗位」—— job_recommendation 全链路。"""
     name = "岗位推荐全链路"
     c = Checker()
     start = time.time()
     try:
-        final = run_turn(
+        final, tr = run_turn_traced(
             app, "帮我推荐几个北京的大模型方向实习岗位",
             session_id="accept_s1", pdf_path=RESUME_PDF, top_k=3,
         )
+        c.bind(tr)
         ctx["s1_final"] = final
 
-        c.expect(final.get("task_type") == "job_recommendation",
-                 f"task_type=job_recommendation（实际 {final.get('task_type')}）")
+        c.expect(final.get("intent") == "RECOMMEND",
+                 f"intent=RECOMMEND（实际 {final.get('intent')}）")
         rc = final.get("retrieval_config") or {}
         c.expect(rc.get("city_filter") == "北京", f"FC planner 抽出 city=北京（实际 {rc.get('city_filter')}）")
 
+        # 节点级定位：把"最终没岗位"拆解到 planner / 检索 / 评分，定位偏差起点
+        c.at("planner", lambda s: (s["retrieval_config"] or {}).get("city_filter") == "北京",
+             "planner 节点抽出 city=北京")
+        c.at("job_retriever", lambda s: s["n_candidates"] >= 1, "检索节点召回候选 ≥1")
+        c.at("match_scorer", lambda s: s["n_match_results"] >= 1, "评分节点产出结果 ≥1")
+
+        # 岗位类型硬约束默认实习（scenario_overview §2.1）
+        c.expect((final.get("retrieval_config") or {}).get("job_type_filter") == "实习",
+                 f"岗位类型默认实习（实际 {(final.get('retrieval_config') or {}).get('job_type_filter')}）")
+
         mrs = final.get("match_results") or []
         c.expect(len(mrs) >= 1, f"召回并评分岗位 ≥1（实际 {len(mrs)}）")
-        c.expect(all((m.get("match_score") or {}).get("final_score") is not None for m in mrs),
-                 "每个岗位都有 final_score")
+        c.expect(all((m.get("match_score") or {}).get("rank_score") is not None for m in mrs),
+                 "每个岗位都有 rank_score（最终推荐分）")
+        c.expect(all((m.get("match_score") or {}).get("match_score") is not None for m in mrs),
+                 "每个岗位都有 match_score（基础适配分）")
         c.expect(all((m.get("report") or "").strip() for m in mrs), "每个岗位都有推荐报告")
         c.expect(all(len(m.get("jd_profile") or {}) >= 10 for m in mrs),
                  "候选 jd_profile 来自 SQLite 回填（字段完整）")
         c.expect(all((((m.get("jd_profile") or {}).get("location")) or {}).get("city") == "北京"
                      for m in mrs),
                  "全部岗位城市均为北京（硬约束生效）")
-        # 无增强诉求：Tool Calling 不应调用任何工具
+        # 无 ASSIST 诉求：推荐默认不生成学习计划 / 面试题（仅 intent=ASSIST + assist_actions 才触发）
         c.expect(not (final.get("learning_plan") or {}).get("stages"), "未请求时不生成学习计划")
         c.expect(not (final.get("interview_prep") or {}).get("questions"), "未请求时不生成面试题")
 
-        score0 = (mrs[0].get("match_score") or {}).get("final_score")
-        _record(1, name, True, f"召回 {len(mrs)} 岗，首位 final_score={score0}",
-                time.time() - start, c.items)
+        score0 = (mrs[0].get("match_score") or {}).get("rank_score")
+        _record(1, name, True, f"召回 {len(mrs)} 岗，首位 rank_score={score0}",
+                time.time() - start, c.items, [tr])
     except Exception as e:
-        _record(1, name, False, f"{type(e).__name__}: {e}", time.time() - start, c.items)
+        _record(1, name, False, f"{type(e).__name__}: {e}", time.time() - start, c.items, [c.trace] if c.trace else [])
 
 
-def scenario_2_jd_eval_full_enhancements(app, run_turn, ctx):
-    """S2：上传简历 + JD + 「适合吗？给学习计划和面试题」—— 评估链路 + Tool Calling 全增强。"""
-    name = "JD 评估 + 全增强"
+def scenario_2_jd_eval_full_enhancements(app, run_turn_traced, ctx):
+    """S2：① 上传简历 + JD 评估适配；② 针对该岗位 job_id 请求学习计划 + 面试练习题（ASSIST）。"""
+    name = "JD 评估 + ASSIST 辅助"
     c = Checker()
     start = time.time()
+    traces = []
     try:
+        # 轮①：JD 评估（默认含匹配点 + 技能缺口，不自动出学习/面试）
         jd_text = _read_text(JD_EVAL_FILE)
-        final = run_turn(
-            app, "这个岗位适合我吗？顺便给我一份补齐差距的学习计划，再出几道模拟面试题",
+        t1, tr1 = run_turn_traced(
+            app, "这个岗位适合我吗？我缺哪些技能？",
             session_id="accept_s2", pdf_path=RESUME_PDF, jd_text=jd_text,
         )
-        ctx["s2_final"] = final
+        traces.append(c.bind(tr1))
+        ctx["s2_final"] = t1
 
-        c.expect(final.get("task_type") == "jd_evaluation",
-                 f"task_type=jd_evaluation（实际 {final.get('task_type')}）")
-        c.expect(bool(final.get("ingested_job_id")),
-                 f"jd_ingest 入库/去重命中（job_id={final.get('ingested_job_id')}）")
-
-        mrs = final.get("match_results") or []
+        c.expect(t1.get("intent") == "EVALUATE", f"轮① intent=EVALUATE（实际 {t1.get('intent')}）")
+        c.expect(bool(t1.get("ingested_job_id")),
+                 f"jd_ingest 入库/去重命中（job_id={t1.get('ingested_job_id')}）")
+        mrs = t1.get("match_results") or []
         c.expect(len(mrs) == 1, f"单 JD 评估产出 1 条结果（实际 {len(mrs)}）")
         mr0 = mrs[0]
         c.expect(bool((mr0.get("report") or "").strip()), "推荐报告非空")
         c.expect(len((mr0.get("skill_gap") or {}).get("items") or []) >= 1, "skill_gap 有逐项分析")
+        c.expect(not (t1.get("learning_plan") or {}).get("stages"), "轮① 未请求时不出学习计划")
+        c.expect(not (t1.get("interview_prep") or {}).get("questions"), "轮① 未请求时不出面试题")
 
-        plan = final.get("learning_plan") or {}
-        c.expect(len(plan.get("stages") or []) >= 1,
-                 f"Tool Calling 触发学习计划（阶段数 {len(plan.get('stages') or [])}）")
-        questions = (final.get("interview_prep") or {}).get("questions") or []
-        c.expect(len(questions) == 3, f"面试题恰好 3 道（实际 {len(questions)}）")
+        job_id = mr0.get("job_id")
+
+        # 轮②：针对该 job_id 请求学习计划 + 面试练习题（ASSIST）
+        t2, tr2 = run_turn_traced(
+            app, f"针对 {job_id} 给我一份补齐差距的学习计划，再出几道岗位定制面试练习题",
+            session_id="accept_s2", pdf_path=None,
+        )
+        traces.append(c.bind(tr2))
+
+        c.at("planner", lambda s: s["intent"] == "ASSIST", "轮② planner 识别 intent=ASSIST")
+        c.expect(t2.get("intent") == "ASSIST", f"轮② intent=ASSIST（实际 {t2.get('intent')}）")
+        c.expect(t2.get("selected_item_ref") == job_id, f"轮② 指代命中 job_id={job_id}")
+        c.expect("job_retriever" not in tr2.nodes(), "轮② 不重新召回（ASSIST 复用缓存岗位）")
+
+        plan = t2.get("learning_plan") or {}
+        c.expect(("stages" in plan) or bool(plan.get("overall_suggestion")),
+                 "ASSIST 产出学习计划（阶段或无核心缺口建议）")
+        questions = (t2.get("interview_prep") or {}).get("questions") or []
+        c.expect(len(questions) == 3, f"面试练习题恰好 3 道（实际 {len(questions)}）")
 
         _record(2, name, True,
-                f"score={(mr0.get('match_score') or {}).get('final_score')}, "
+                f"rank_score={(mr0.get('match_score') or {}).get('rank_score')}, "
                 f"学习计划 {len(plan.get('stages') or [])} 阶段, 面试题 {len(questions)} 道",
-                time.time() - start, c.items)
+                time.time() - start, c.items, traces)
     except Exception as e:
-        _record(2, name, False, f"{type(e).__name__}: {e}", time.time() - start, c.items)
+        _record(2, name, False, f"{type(e).__name__}: {e}", time.time() - start, c.items, traces)
 
 
-def scenario_3_memory_and_commute(app, run_turn, ctx):
+def scenario_3_memory_and_commute(app, run_turn_traced, ctx):
     """S3：同一会话两轮——①传简历评估 JD；②不传简历，带通勤约束求推荐。
 
     隐式验证：画像缓存（轮② cached）、对话历史注入；
@@ -190,20 +254,28 @@ def scenario_3_memory_and_commute(app, run_turn, ctx):
     c = Checker()
     start = time.time()
     session = "accept_s3"
+    traces = []
     try:
         # 轮①：上传简历 + 评估 JD（建立画像与对话历史）
-        t1 = run_turn(app, "看看这个岗位适合我吗", session_id=session,
-                      pdf_path=RESUME_PDF, jd_text=_read_text(JD_EVAL_FILE))
+        t1, tr1 = run_turn_traced(app, "看看这个岗位适合我吗", session_id=session,
+                                  pdf_path=RESUME_PDF, jd_text=_read_text(JD_EVAL_FILE))
+        traces.append(c.bind(tr1))
         c.expect(t1.get("profile_source") == "new_upload",
                  f"轮① 画像保存 new_upload（实际 {t1.get('profile_source')}）")
 
         # 轮②：不传简历，带通勤约束求推荐（公交地铁 + 1 小时上限）
-        t2 = run_turn(app, "帮我推荐实习岗位，我住在北京市海淀区中关村，公交地铁通勤1小时以内",
-                      session_id=session, pdf_path=None)
+        t2, tr2 = run_turn_traced(app, "帮我推荐实习岗位，我住在北京市海淀区中关村，公交地铁通勤1小时以内",
+                                  session_id=session, pdf_path=None)
+        traces.append(c.bind(tr2))  # 后续 at() 针对轮② trace
         ctx["s3_final"] = t2
 
         c.expect(t2.get("profile_source") == "cached",
                  f"轮② 复用缓存画像（实际 {t2.get('profile_source')}）")
+        # 节点级定位：画像复用由 profile_cache 节点决定，通勤意图由 planner 抽取
+        c.at("profile_cache", lambda s: s["profile_source"] == "cached", "轮② profile_cache 命中缓存")
+        c.at("planner", lambda s: (s["commute_intent"] or {}).get("max_commute_minutes") == 60
+             and (s["commute_intent"] or {}).get("preferred_transport") == "transit",
+             "planner 抽出通勤意图（60min / transit）")
         intent = t2.get("commute_intent") or {}
         c.expect("中关村" in (intent.get("user_address") or ""),
                  f"通勤地址抽取（实际 {intent.get('user_address')}）")
@@ -227,59 +299,93 @@ def scenario_3_memory_and_commute(app, run_turn, ctx):
             c.expect(bool(t2.get("commute_note")), "无 AMAP_KEY 时降级为通勤说明")
             detail = t2.get("commute_note") or ""
 
-        _record(3, name, True, f"首位通勤：{detail[:60]}", time.time() - start, c.items)
+        # 轮③：ASSIST 指代 job_id 出面试练习题 —— 位置指代已不支持，须用 job_id
+        target_id = mrs[0].get("job_id")
+        t3, tr3 = run_turn_traced(app, f"给 {target_id} 出几道面试练习题", session_id=session, pdf_path=None)
+        traces.append(c.bind(tr3))
+        c.at("planner", lambda s: s["intent"] == "ASSIST", "planner 识别 intent=ASSIST（非新检索）")
+        ref = t3.get("selected_item_ref")
+        c.expect(ref == target_id, f"job_id 指代解析（实际 {ref}）")
+        c.expect("job_retriever" not in tr3.nodes(), "ASSIST 不重新召回")
+        q3 = (t3.get("interview_prep") or {}).get("questions") or []
+        c.expect(len(q3) == 3, f"针对指代岗位出 3 道面试练习题（实际 {len(q3)}）")
+
+        _record(3, name, True, f"首位通勤：{detail[:50]}；ASSIST→{ref}",
+                time.time() - start, c.items, traces)
     except Exception as e:
-        _record(3, name, False, f"{type(e).__name__}: {e}", time.time() - start, c.items)
+        _record(3, name, False, f"{type(e).__name__}: {e}", time.time() - start, c.items, traces)
 
 
-def scenario_4_city_hard_constraint(app, run_turn, ctx):
-    """S4：「推荐深圳的实习岗位」（库中无深圳岗）—— 城市硬约束提前终止。"""
+def scenario_4_city_hard_constraint(app, run_turn_traced, ctx):
+    """S4：「推荐武汉的实习岗位」（库中无武汉岗）—— 城市硬约束提前终止。
+
+    选「武汉」是因为它在岗位库（含多城市阿里岗）中零命中；深圳/广州等已被多城市岗位覆盖。
+    """
     name = "城市硬约束提前终止"
     c = Checker()
     start = time.time()
     try:
-        final = run_turn(app, "帮我推荐深圳的实习岗位",
-                         session_id="accept_s4", pdf_path=RESUME_PDF)
+        final, tr = run_turn_traced(app, "帮我推荐武汉的实习岗位",
+                                    session_id="accept_s4", pdf_path=RESUME_PDF)
+        c.bind(tr)
         ctx["s4_final"] = final
 
         rc = final.get("retrieval_config") or {}
-        c.expect(rc.get("city_filter") == "深圳", f"FC planner 抽出 city=深圳（实际 {rc.get('city_filter')}）")
+        c.expect(rc.get("city_filter") == "武汉", f"FC planner 抽出 city=武汉（实际 {rc.get('city_filter')}）")
+
+        # 节点级定位：提前终止应发生在 job_retriever（召回=0 即写 final_response 告知），
+        # 且评分节点应未运行 / 未产出——证明零浪费而非"评分后才发现没结果"
+        c.at("job_retriever", lambda s: s["n_candidates"] == 0 and s["has_final_response"],
+             "检索节点召回=0 并就地写出告知文案（提前终止）")
+        c.expect("match_scorer" not in tr.nodes() or (tr.summary_at("match_scorer") or {}).get("n_match_results", 0) == 0,
+                 "评分节点未对错误城市产出结果（零浪费）")
+
         c.expect(not (final.get("match_results") or []),
                  "match_results 为空（未对错误城市浪费评分调用）")
         resp = final.get("final_response") or ""
-        c.expect("深圳" in resp and "暂无" in resp, f"明确告知暂无深圳岗位（实际：{resp[:50]}）")
+        c.expect("武汉" in resp and "暂无" in resp, f"明确告知暂无武汉岗位（实际：{resp[:50]}）")
         c.expect("不限城市" in resp, "提示用户可放宽到不限城市")
 
-        _record(4, name, True, f"提前终止：{resp[:60]}", time.time() - start, c.items)
+        _record(4, name, True, f"提前终止：{resp[:60]}", time.time() - start, c.items, [tr])
     except Exception as e:
-        _record(4, name, False, f"{type(e).__name__}: {e}", time.time() - start, c.items)
+        _record(4, name, False, f"{type(e).__name__}: {e}", time.time() - start, c.items, [c.trace] if c.trace else [])
 
 
-def scenario_5_edge_cases(app, run_turn, pc, ctx):
-    """S5：边界鲁棒——①无简历无缓存求推荐；②缺 JD 求评估。均应优雅降级不崩溃。
+def scenario_5_clarification(app, run_turn_traced, pc, ctx):
+    """S5：澄清机制——缺关键槽位时追问而非跑半成品（「跑错链路比多问一句更糟」）。
 
+    ① 无简历无缓存求推荐 → 追问上传简历；② 有简历但缺 JD 求评估 → 追问 JD。
+    两类都应：plan.clarify=True、final_response 为澄清问题、不产出岗位结果、业务节点未跑。
     注意：本场景会清空画像缓存，必须最后运行。
     """
-    name = "边界鲁棒"
+    name = "澄清机制"
     c = Checker()
     start = time.time()
+    traces = []
     try:
         pc.delete_profiles(pc.DEFAULT_USER_ID)  # 清空缓存，制造「无画像」环境
 
-        # ① 无简历且无缓存画像，直接求推荐
-        f1 = run_turn(app, "帮我推荐适合我的实习岗位", session_id="accept_s5a", pdf_path=None)
-        c.expect(not (f1.get("match_results") or []), "①无画像时不产出岗位结果")
-        errs1 = " ".join(str(e) for e in (f1.get("errors") or []))
-        c.expect(("简历" in errs1) or ("画像" in errs1), "①errors 含缺简历/画像的可读提示")
+        # ① 无简历且无缓存画像，直接求推荐 → 追问简历
+        f1, tr1 = run_turn_traced(app, "帮我推荐适合我的实习岗位", session_id="accept_s5a", pdf_path=None)
+        traces.append(c.bind(tr1))
+        c.at("planner", lambda s: (s["plan"] or {}).get("clarify") is True, "①planner 判定需澄清")
+        c.expect(not (f1.get("match_results") or []), "①澄清时不产出岗位结果")
+        c.expect("简历" in (f1.get("final_response") or ""), "①追问上传简历")
+        c.expect("job_retriever" not in tr1.nodes(), "①未跑检索节点（澄清短路）")
 
-        # ② 评估意图但未提供 JD（也无简历）
-        f2 = run_turn(app, "帮我分析一下这个岗位适不适合我", session_id="accept_s5b", pdf_path=None)
-        c.expect(not (f2.get("match_results") or []), "②缺输入时不产出岗位结果")
-        c.expect(len(f2.get("errors") or []) >= 1, "②errors 含可读提示")
+        # ② 有简历（缓存命中）但缺 JD 求评估 → 追问 JD
+        seed = (ctx.get("s1_final") or {}).get("resume_profile") or {"skills": ["Python"]}
+        pc.save_profile(pc.DEFAULT_USER_ID, "", seed)
+        f2, tr2 = run_turn_traced(app, "帮我分析这个岗位适不适合我", session_id="accept_s5b", pdf_path=None)
+        traces.append(c.bind(tr2))
+        c.expect((f2.get("plan") or {}).get("clarify") is True, "②planner 判定需澄清")
+        c.expect(not (f2.get("match_results") or []), "②澄清时不产出岗位结果")
+        c.expect(bool(f2.get("final_response")), "②给出澄清问题")
 
-        _record(5, name, True, "两类缺输入场景均优雅降级", time.time() - start, c.items)
+        _record(5, name, True, "缺简历/缺 JD 均触发澄清、未跑业务链路",
+                time.time() - start, c.items, traces)
     except Exception as e:
-        _record(5, name, False, f"{type(e).__name__}: {e}", time.time() - start, c.items)
+        _record(5, name, False, f"{type(e).__name__}: {e}", time.time() - start, c.items, traces)
 
 
 # ---------------------------------------------------------------------------
@@ -288,18 +394,18 @@ def scenario_5_edge_cases(app, run_turn, pc, ctx):
 _PRINCIPLES = """\
 1. **场景即用户旅程**：每个场景通过 `run_turn`（真实图执行）验证一条完整链路，不直接调业务函数；
 2. **机制隐式验证**：画像缓存、对话历史注入等基础机制在多轮场景（S3）内以断言覆盖，不单独立场景；
-3. **一场景多断言**：核验链路上各关键节点产物（规划抽取、检索回填、Tool Calling 决策、输出结构），失败精确到断言；
+3. **一场景多断言**：核验链路上各关键节点产物（规划抽取、检索回填、ASSIST 驱动增强、澄清短路、输出结构），失败精确到断言；
 4. **数据隔离**：验收目录拷贝真实库后运行，入库/画像/会话写操作不污染 `data/`；
 5. **职责分离**：检索质量指标（Recall@K / MRR / nDCG）由 `resume2job/eval` 负责，本验收只管链路正确性。"""
 
 _MATRIX = """\
 | 场景 | 用户旅程 | 覆盖能力 |
 |---|---|---|
-| S1 岗位推荐全链路 | 传简历 +「推荐北京的大模型实习岗位」 | FC planner 条件抽取、混合检索（BM25+向量+RRF+rerank）、SQLite 回填、城市约束、增强工具零调用 |
-| S2 JD 评估 + 全增强 | 传简历 + JD +「适合吗？给学习计划和面试题」 | jd_evaluation 链路、jd_ingest 去重入库、Tool Calling 多工具触发、skill_gap / 学习计划 / 3 道面试题 |
-| S3 多轮记忆 + 通勤 | 轮① 传简历评估 JD；轮② 不传简历「我住中关村，公交地铁通勤1小时以内」求推荐 | 画像缓存命中、对话历史注入、通勤意图抽取（地址/60min/transit）、高德路线与时长并入报告、通勤重排 |
+| S1 岗位推荐全链路 | 传简历 +「推荐北京的大模型实习岗位」 | planner FC 抽 intent=RECOMMEND + 条件、混合检索（BM25+向量+RRF+rerank）、SQLite 回填、城市约束、未请求时不开增强视图 |
+| S2 JD 评估 + ASSIST 辅助 | ① 传简历 + JD 评估；②「针对 job_X 给学习计划和面试练习题」 | intent=EVALUATE 评估默认含技能缺口、jd_ingest 去重入库；intent=ASSIST 复用缓存岗位生成学习计划 + 3 道面试练习题 |
+| S3 多轮记忆 + 通勤 + 指代 | 轮① 评估 JD；轮② 不传简历「我住中关村，公交地铁1小时内」求推荐；轮③「第二个出面试题」 | 画像缓存命中、通勤意图抽取与路线/时长进报告、**last_results 结构化指代（「第二个」→job_id）+ FOLLOWUP 复用** |
 | S4 城市硬约束提前终止 | 「推荐深圳的实习岗位」（库中无深圳岗） | 城市硬约束（检索级联不丢城市）、零浪费提前终止、final_response 告知并询问放宽 |
-| S5 边界鲁棒 | ①无简历无缓存求推荐 ②缺 JD 求评估 | 缺输入优雅降级、错误提示可读、不崩溃 |"""
+| S5 澄清机制 | ①无简历无缓存求推荐 ②有简历缺 JD 求评估 | 缺关键槽位时 planner 判 clarify、追问而非跑半成品、业务节点短路 |"""
 
 
 def write_report() -> None:
@@ -322,10 +428,10 @@ def write_report() -> None:
         "",
     ]
 
-    passed = sum(1 for _, _, ok, _, _, _ in _RESULTS if ok)
+    passed = sum(1 for r in _RESULTS if r[2])
     lines.append(f"**总计：{passed} / {len(_RESULTS)} 通过**")
     lines.append("")
-    for no, name, ok, detail, elapsed, checks in sorted(_RESULTS):
+    for no, name, ok, detail, elapsed, checks, traces in sorted(_RESULTS, key=lambda r: r[0]):
         lines.append(f"### S{no} {name} — {'✅ PASS' if ok else '❌ FAIL'}（{elapsed:.1f}s）")
         lines.append("")
         if detail:
@@ -334,6 +440,15 @@ def write_report() -> None:
         for desc, c_ok in checks:
             lines.append(f"- {'✓' if c_ok else '✗'} {desc}")
         lines.append("")
+        # 链路时序：每轮一张表（节点顺序 / 耗时 / 改动字段 / 关键信号）
+        for i, tr in enumerate(traces or [], start=1):
+            label = f"链路追踪 轮{i}" if len(traces) > 1 else "链路追踪"
+            lines.append(f"<details><summary>🔍 {label}（trace_id=`{tr.trace_id}`）</summary>")
+            lines.append("")
+            lines.append(tr.as_markdown_table())
+            lines.append("")
+            lines.append("</details>")
+            lines.append("")
 
     lines += [
         "## 运行环境",
@@ -375,21 +490,21 @@ def main(argv=None):
     print("=" * 64)
 
     pc, _jd = setup_env()
-    from resume2job.agent.graph import build_graph, run_turn
+    from resume2job.agent.graph import build_graph, run_turn_traced
     app = build_graph()
     ctx = {}
 
     for n in selected:
         if n == 1:
-            scenario_1_job_recommendation(app, run_turn, ctx)
+            scenario_1_job_recommendation(app, run_turn_traced, ctx)
         elif n == 2:
-            scenario_2_jd_eval_full_enhancements(app, run_turn, ctx)
+            scenario_2_jd_eval_full_enhancements(app, run_turn_traced, ctx)
         elif n == 3:
-            scenario_3_memory_and_commute(app, run_turn, ctx)
+            scenario_3_memory_and_commute(app, run_turn_traced, ctx)
         elif n == 4:
-            scenario_4_city_hard_constraint(app, run_turn, ctx)
+            scenario_4_city_hard_constraint(app, run_turn_traced, ctx)
         elif n == 5:
-            scenario_5_edge_cases(app, run_turn, pc, ctx)
+            scenario_5_clarification(app, run_turn_traced, pc, ctx)
         else:
             print(f"[跳过] 未知场景编号：{n}")
 
@@ -397,8 +512,8 @@ def main(argv=None):
     print("\n" + "=" * 64)
     print("验收汇总")
     print("=" * 64)
-    passed = sum(1 for _, _, ok, _, _, _ in _RESULTS if ok)
-    for no, name, ok, detail, elapsed, _checks in sorted(_RESULTS):
+    passed = sum(1 for r in _RESULTS if r[2])
+    for no, name, ok, detail, elapsed, _checks, _traces in sorted(_RESULTS, key=lambda r: r[0]):
         print(f"  S{no} [{'PASS' if ok else 'FAIL'}] {name}（{elapsed:.1f}s）")
         if detail:
             print(f"        {detail}")

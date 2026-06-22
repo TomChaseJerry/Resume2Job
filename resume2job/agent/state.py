@@ -14,42 +14,25 @@ LangGraph 工作流的全局 State 定义。
 本文件只定义 State 类型与初始化函数，不包含任何节点逻辑或具体业务实现。
 """
 
-from typing import TypedDict, Optional, List, Dict, Any, Literal
+from typing import TypedDict, Optional, List, Dict, Any
+
+# 执行计划是 policy_orchestrator 产出的裸 dict（session_action + need_* 开关 + 澄清字段）；
+# 这里 plan 字段以 Dict 注解承载，避免 state ← planner 的包初始化依赖。
 
 
 # ---------------------------------------------------------------------------
-# 1. PlanConfig
+# RetrievalConfig
 # ---------------------------------------------------------------------------
-class PlanConfig(TypedDict):
-    """
-    Planner 节点生成的任务规划（主链路开关）。
-
-    每个布尔字段表示某个子任务是否需要执行，
-    后续节点据此决定自身是否被激活（条件分支 / 跳过）。
-
-    注意：通勤 / 学习计划 / 面试题等可选增强不在此处——它们由
-    enhancement_node 的 LLM Tool Calling 在评分完成后自主决定是否调用。
-    """
-    need_resume_parse: bool   # 是否需要解析简历 PDF
-    need_job_search: bool     # 是否需要从岗位知识库检索岗位
-    need_jd_input: bool       # 用户是否直接提供 JD 原文
-    need_jd_parse: bool       # 是否需要解析 JD
-    need_match_score: bool    # 是否需要进行岗位匹配评分
-    need_recommendation: bool # 是否需要生成推荐报告
-    need_skill_gap: bool      # 是否需要技能差距分析
-
-
-# ---------------------------------------------------------------------------
-# 2. RetrievalConfig
-# ---------------------------------------------------------------------------
-class RetrievalConfig(TypedDict):
+class RetrievalConfig(TypedDict, total=False):
     """
     岗位检索参数，由用户输入初始化，供 Job Search 节点使用。
+    方向不再是硬过滤（仅进 Query3 + direction_bonus），故无 direction_filter。
     """
-    top_k: int                          # 召回岗位数量
-    city_filter: Optional[str]          # 城市过滤条件，例如「北京」
-    direction_filter: Optional[str]     # 岗位方向过滤条件，例如「大模型算法」
-    education_filter: Optional[str]     # 学历过滤条件，例如「硕士」
+    top_k: int                          # 候选池大小（召回 + 评分数量，≥展示数）
+    display_k: int                      # 本轮展示岗位数（用户请求数）
+    city_filter: Optional[str]          # 城市硬约束，例如「北京」
+    education_filter: Optional[str]     # 候选人学历（默认取自简历画像）；召回前资格预筛「岗位要求≤该学历」
+    job_type_filter: Optional[str]      # 岗位类型硬约束：实习 / 校招 / 社招，默认「实习」
 
 
 # ---------------------------------------------------------------------------
@@ -65,8 +48,11 @@ class MatchResult(TypedDict):
     job_id: str                     # 岗位 ID
     jd_profile: Dict[str, Any]      # 结构化 JD（JD Parser 输出）
     match_score: Dict[str, Any]     # Match Scorer 输出
-    skill_gap: Dict[str, Any]       # Skill Gap Analyzer 输出（Stage 4 内部分析）
-    report: str                     # Recommendation Writer 输出的推荐报告
+    skill_gap: Dict[str, Any]       # 技能差距聚合（惰性叙述：未展示池岗位为空 {}）
+    report: str                     # 推荐报告（惰性叙述：未展示池岗位为 ""）
+    # 运行时按需追加（非每个 MatchResult 都有）：
+    #   _writer  {reason, suggestion}  叙述缓存，换一批/重排时纯 Python 重组报告免重复调 LLM；
+    #   commute  通勤计算结果           enhancement 的 _run_commute 写入。
 
 
 # ---------------------------------------------------------------------------
@@ -92,11 +78,15 @@ class AgentState(TypedDict):
     messages: List[Dict[str, Any]]  # 本轮注入的历史消息 [{role, content, ...}]
 
     # ---------- 任务规划（Planner 节点写入） ----------
-    task_type: Optional[Literal["job_recommendation", "jd_evaluation", "skill_gap_only"]]
-    plan: Optional[PlanConfig]      # 各子任务是否执行的规划
+    intent: Optional[str]           # RECOMMEND / EVALUATE / ASSIST
+    plan: Optional[Dict[str, Any]]  # 执行计划 dict：session_action + need_* 开关 + 澄清（policy_orchestrator 产出）
+    hard_constraints: Dict[str, Any]   # 硬过滤：city / education / job_type
+    soft_preferences: Dict[str, Any]   # 本轮抽取的软偏好：direction_tags（加权，非过滤）
+    preference_tags: Dict[str, Any]    # 会话活跃方向偏好 {tag: weight}，供 Query3 召回 / direction_bonus
+    selected_item_ref: str          # SELECTED/ASSIST 指代解析出的 job_id，默认 ""
 
-    # ---------- 通勤意图（Commute Planner 节点写入） ----------
-    commute_intent: Optional[Dict[str, Any]]  # 住址 / 时间上限 / 交通方式等通勤约束
+    # ---------- 通勤意图（Planner 写入，供 enhancements 通勤计算读取） ----------
+    commute_intent: Optional[Dict[str, Any]]      # commute 工具的 intent 结构
 
     # ---------- 检索配置（启动时填充，Job Search 节点读取） ----------
     retrieval_config: RetrievalConfig
@@ -109,8 +99,11 @@ class AgentState(TypedDict):
     profile_source: str       # "new_upload" | "cached" | ""（未加载）
 
     # ---------- 岗位检索结果（Job Search 节点写入） ----------
-    search_queries: Dict[str, str]            # 检索使用的查询语句
     candidate_jobs: List[Dict[str, Any]]      # 召回的候选岗位列表
+
+    # ---------- 候选池复用（换一批 / 重排，item8） ----------
+    candidate_pool: List[Dict[str, Any]]      # 全量已评分候选（>展示数），供换一批/重排复用
+    shown_job_ids: List[str]                  # 本会话已展示的 job_id（换一批从未展示中取）
 
     # ---------- JD 解析结果（JD Parser 节点写入） ----------
     jd_profiles: List[Dict[str, Any]]         # 结构化 JD 列表
@@ -152,8 +145,8 @@ def get_initial_state(
     jd_text: Optional[str] = None,
     top_k: int = 5,
     city_filter: Optional[str] = None,
-    direction_filter: Optional[str] = None,
     education_filter: Optional[str] = None,
+    job_type_filter: Optional[str] = "实习",
     session_id: str = "",
     messages: Optional[List[Dict[str, Any]]] = None,
 ) -> AgentState:
@@ -168,9 +161,9 @@ def get_initial_state(
         pdf_path:          简历 PDF 路径，默认为 None。
         jd_text:           用户粘贴的 JD 原文，默认为 None。
         top_k:             召回岗位数量，默认为 5。
-        city_filter:       城市过滤条件。
-        direction_filter:  岗位方向过滤条件。
-        education_filter:  学历过滤条件。
+        city_filter:       城市硬约束。
+        education_filter:  学历硬约束。
+        job_type_filter:   岗位类型硬约束（实习/校招/社招），默认实习。
 
     Returns:
         完整初始化的 AgentState。
@@ -186,18 +179,23 @@ def get_initial_state(
         messages=messages or [],
 
         # 任务规划：由 Planner 节点后续填充
-        task_type=None,
+        intent=None,
         plan=None,
+        hard_constraints={},
+        soft_preferences={},
+        preference_tags={},
+        selected_item_ref="",
 
-        # 通勤意图：由 Commute Planner 节点后续填充
+        # 通勤意图：由 Planner 节点后续填充
         commute_intent=None,
 
         # 检索配置
         retrieval_config=RetrievalConfig(
             top_k=top_k,
+            display_k=top_k,
             city_filter=city_filter,
-            direction_filter=direction_filter,
             education_filter=education_filter,
+            job_type_filter=job_type_filter,
         ),
 
         # 简历画像：尚未生成
@@ -207,9 +205,10 @@ def get_initial_state(
         profile_id="",
         profile_source="",
 
-        # 岗位检索结果：列表 / 字典初始化为空
-        search_queries={},
+        # 岗位检索结果：列表初始化为空
         candidate_jobs=[],
+        candidate_pool=[],
+        shown_job_ids=[],
 
         # JD 解析结果
         jd_profiles=[],

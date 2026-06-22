@@ -42,6 +42,12 @@ CREATE TABLE IF NOT EXISTS jobs (
     skills          TEXT NOT NULL DEFAULT '[]',  -- JSON 数组字符串
     source          TEXT NOT NULL DEFAULT 'user_uploaded',
     embedding_id    TEXT,                        -- 向量库中对应的 document id
+    -- 硬约束预过滤列（召回前 eligibility 用；由 jd_parser.derive_constraint_fields 入库时算好）
+    cities_json     TEXT NOT NULL DEFAULT '[]',         -- 规范化城市数组（多城市岗多个）
+    job_types_json  TEXT NOT NULL DEFAULT '[]',         -- 岗位类型数组（实习/校招/社招）
+    min_degree_rank INTEGER,                            -- 最低学历 rank（本1硕2博3）；NULL=不限/未明确
+    city_status     TEXT NOT NULL DEFAULT 'unknown',    -- explicit / unknown
+    education_status TEXT NOT NULL DEFAULT 'unknown',   -- explicit / unrestricted / unknown
     created_at      TEXT NOT NULL,
     updated_at      TEXT
 );
@@ -63,6 +69,12 @@ _MIGRATION_COLUMNS = (
     ("jd_profile_json", "TEXT NOT NULL DEFAULT '{}'"),
     ("index_text", "TEXT NOT NULL DEFAULT ''"),
     ("updated_at", "TEXT"),
+    # 硬约束预过滤列（2026-06-21 加；旧库 ALTER 补齐，再跑 indexer.backfill_constraint_fields 回填值）
+    ("cities_json", "TEXT NOT NULL DEFAULT '[]'"),
+    ("job_types_json", "TEXT NOT NULL DEFAULT '[]'"),
+    ("min_degree_rank", "INTEGER"),
+    ("city_status", "TEXT NOT NULL DEFAULT 'unknown'"),
+    ("education_status", "TEXT NOT NULL DEFAULT 'unknown'"),
 )
 
 
@@ -128,8 +140,10 @@ def upsert_job(job: dict) -> None:
             "INSERT OR REPLACE INTO jobs "
             "(job_id, company, title, city, direction, education_level, "
             " jd_text, jd_hash, jd_profile_json, index_text, "
-            " requirements, skills, source, embedding_id, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " requirements, skills, source, embedding_id, "
+            " cities_json, job_types_json, min_degree_rank, city_status, education_status, "
+            " created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 job["job_id"],
                 job.get("company") or "unknown_company",
@@ -145,6 +159,12 @@ def upsert_job(job: dict) -> None:
                 json.dumps(job.get("skills") or [], ensure_ascii=False),
                 job.get("source") or "user_uploaded",
                 job.get("embedding_id") or job["job_id"],
+                # 硬约束预过滤列（写入方经 jd_parser.derive_constraint_fields 算好传入；缺省给空/unknown）
+                json.dumps(job.get("cities_json") or [], ensure_ascii=False),
+                json.dumps(job.get("job_types_json") or [], ensure_ascii=False),
+                job.get("min_degree_rank"),
+                job.get("city_status") or "unknown",
+                job.get("education_status") or "unknown",
                 created_at,
                 now,
             ),
@@ -258,6 +278,88 @@ def count() -> int:
             return conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
     except Exception:
         return 0
+
+
+def all_jobs_min() -> List[dict]:
+    """取全部岗位的 {job_id, jd_profile, jd_text}（回填硬约束列 / 重判 job_type 用，纯 SQLite）。"""
+    try:
+        with _conn() as conn:
+            rows = conn.execute("SELECT job_id, jd_profile_json, jd_text FROM jobs").fetchall()
+        out = []
+        for r in rows:
+            try:
+                prof = json.loads(r["jd_profile_json"] or "{}")
+            except json.JSONDecodeError:
+                prof = {}
+            out.append({"job_id": r["job_id"], "jd_profile": prof if isinstance(prof, dict) else {},
+                        "jd_text": r["jd_text"] or ""})
+        return out
+    except Exception as e:
+        print(f"[jobs_store] 警告：读取全量画像失败：{e}")
+        return []
+
+
+def get_eligible_jobs(city, user_degree_rank, job_type) -> Dict[str, dict]:
+    """硬约束资格预筛（召回**前**）：返回 {job_id: {city_match_status, education_match_status}}。
+
+    取原语而非约束对象（storage 层不依赖 retrieval）。规则：
+      - 仅 index_text 非空（已可检索）的岗位；
+      - 城市：用户指定时保留「cities 含该城市」或「city_status=unknown（地点待确认）」；未指定不卡；
+      - 学历：保留「无明确要求（min_degree_rank IS NULL，即 unrestricted/unknown）」或「要求 ≤ 候选人学历」；
+              候选人学历未知（rank=None）时不卡；
+      - 岗位类型：job_types 含该类型（数组为空的旧数据宽松保留）。
+    city_match_status：exact（命中或未限城市）/ unknown（靠 city_status=unknown 进池，地点待确认）；
+    education_match_status：satisfied（明确要求且 ≤ 候选人）/ unverified（不限/未知/候选人学历未知）。
+    """
+    want_city = (str(city).strip() if city else None)
+    try:
+        with _conn() as conn:
+            rows = conn.execute(
+                "SELECT job_id, cities_json, min_degree_rank FROM jobs "
+                "WHERE index_text != '' "
+                "  AND (:rank IS NULL OR min_degree_rank IS NULL OR min_degree_rank <= :rank) "
+                "  AND (job_types_json = '[]' "
+                "       OR EXISTS (SELECT 1 FROM json_each(job_types_json) WHERE value = :jt)) "
+                "  AND (:city IS NULL OR city_status = 'unknown' "
+                "       OR EXISTS (SELECT 1 FROM json_each(cities_json) WHERE value = :city))",
+                {"rank": user_degree_rank, "jt": job_type, "city": want_city},
+            ).fetchall()
+    except Exception as e:
+        print(f"[jobs_store] 警告：eligibility 预筛失败：{e}")
+        return {}
+
+    out: Dict[str, dict] = {}
+    for r in rows:
+        try:
+            cities = json.loads(r["cities_json"] or "[]")
+        except json.JSONDecodeError:
+            cities = []
+        city_match = "exact" if (not want_city or want_city in cities) else "unknown"
+        mr = r["min_degree_rank"]
+        edu_match = ("satisfied" if (mr is not None and user_degree_rank is not None
+                                     and mr <= user_degree_rank) else "unverified")
+        out[r["job_id"]] = {"city_match_status": city_match, "education_match_status": edu_match}
+    return out
+
+
+def update_constraint_fields(job_id: str, cities_json, job_types_json,
+                             min_degree_rank, city_status, education_status) -> None:
+    """回填/更新单条岗位的硬约束预过滤列（只动这 5 列，不碰其他列）。"""
+    if not job_id:
+        return
+    try:
+        with _conn() as conn:
+            conn.execute(
+                "UPDATE jobs SET cities_json=?, job_types_json=?, min_degree_rank=?, "
+                "city_status=?, education_status=? WHERE job_id=?",
+                (json.dumps(cities_json or [], ensure_ascii=False),
+                 json.dumps(job_types_json or [], ensure_ascii=False),
+                 min_degree_rank, city_status or "unknown", education_status or "unknown",
+                 job_id),
+            )
+            conn.commit()
+    except Exception as e:
+        print(f"[jobs_store] 警告：回填约束列失败 {job_id}：{e}")
 
 
 # 模块首次导入时建表（幂等，与 profile_cache / conversation_store 约定一致）

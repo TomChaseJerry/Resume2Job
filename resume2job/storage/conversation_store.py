@@ -95,18 +95,6 @@ def load_history(session_id: str, limit: int = 20) -> list:
         return []
 
 
-def format_history(messages: list, max_chars: int = 1200) -> str:
-    """把消息列表渲染为可读对话文本，用于喂给 LLM。超长时保留末尾（最近）部分。"""
-    if not messages:
-        return ""
-    label = {"user": "用户", "assistant": "助手"}
-    lines = [f"{label.get(m.get('role'), m.get('role'))}：{m.get('content', '')}" for m in messages]
-    text = "\n".join(lines)
-    if len(text) > max_chars:
-        text = "…（更早的对话已省略）\n" + text[-max_chars:]
-    return text
-
-
 def list_sessions() -> list:
     """返回所有 session_id（按最近活跃时间倒序）。"""
     try:

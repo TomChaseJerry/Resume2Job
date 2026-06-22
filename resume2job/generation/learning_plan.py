@@ -5,9 +5,8 @@
     把岗位评估产出的 skill_gap 结构化结果，转化为针对「当前评估岗位」的、
     可执行的阶段化学习计划。
 
-与旧版的差异：
-    旧版按阶段拆分后「每个阶段单独调一次 LLM」，慢且贵；
-    现在 Python 先做确定性编排（时间约束提取 → 技能优先级排序 → 阶段骨架划分），
+生成方式：
+    Python 先做确定性编排（时间约束提取 → 技能优先级排序 → 阶段骨架划分），
     再用 **单次 LLM 调用** 一次性生成所有阶段的 goal / tasks / resources /
     resume_update_suggestion，失败时整体走规则兜底。
 
@@ -275,6 +274,18 @@ def _merge_llm_stages(skeletons: List[dict], parsed: Optional[dict]) -> List[dic
     return stages
 
 
+def _no_core_gap_suggestion(sorted_skills: List[dict]) -> str:
+    """无明显核心（必备）缺口时的建议：不强行补基础，转向项目复盘 / 技术深挖 / 面试表达。"""
+    base = ("该岗位必备技能已基本覆盖，没有明显核心缺口，不需要从零补基础。建议把重点放在："
+            "① 复盘已有项目，梳理目标 / 个人职责 / 难点 / 可量化结果；"
+            "② 针对岗位核心方向做技术深挖，能讲清原理与技术权衡；"
+            "③ 准备面试表达，把项目讲清楚、讲出彩。")
+    prefs = [s["skill"] for s in sorted_skills][:3]
+    if prefs:
+        base += f"如有余力，可补充优先 / 加分技能：{'、'.join(prefs)}。"
+    return base
+
+
 def _build_overall_suggestion(sorted_skills: List[dict]) -> str:
     """整体建议（确定性模板）。"""
     if not sorted_skills:
@@ -328,6 +339,12 @@ def build_learning_plan(match_result: dict, user_query: str) -> dict:
     if not sorted_skills:
         return _empty_plan(target_job_id, target_job_title, daily_hours,
                            _build_overall_suggestion([]), None)
+
+    # 无明显核心（必备）缺口：不强行生成泛化学习计划，转而建议项目复盘 / 技术深挖 / 面试表达
+    core_gaps = [s for s in sorted_skills if s["importance"] == "must"]
+    if not core_gaps:
+        return _empty_plan(target_job_id, target_job_title, daily_hours,
+                           _no_core_gap_suggestion(sorted_skills), None)
 
     skeletons = divide_into_stages(sorted_skills, target_days)
 

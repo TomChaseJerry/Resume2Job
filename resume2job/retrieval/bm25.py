@@ -18,7 +18,7 @@ SQLite 批量回填（hydration）。
 """
 
 import re
-from typing import List, Optional
+from typing import List
 
 from rank_bm25 import BM25Okapi
 
@@ -38,19 +38,6 @@ def tokenize(text: str) -> List[str]:
         if tok and _TOKEN_RE.fullmatch(tok):
             tokens.append(tok)
     return tokens
-
-
-def _match_where(metadata: dict, where: Optional[dict]) -> bool:
-    """对单条 metadata 应用 Chroma 风格的 where 过滤（仅支持本项目用到的
-    等值条件与 {"$and": [...]} 组合，与 build_where_filter 的输出对齐）。"""
-    if not where:
-        return True
-    if "$and" in where:
-        return all(_match_where(metadata, cond) for cond in where["$and"])
-    for field, expected in where.items():
-        if (metadata or {}).get(field) != expected:
-            return False
-    return True
 
 
 class BM25Corpus:
@@ -85,9 +72,10 @@ class BM25Corpus:
         metadatas = res.get("metadatas") or []
         return cls(ids, documents, metadatas)
 
-    def search(self, query_text: str, n_results: int, where: Optional[dict] = None) -> list:
+    def search(self, query_text: str, n_results: int, allowed_ids=None) -> list:
         """BM25 检索，返回与向量通道同构的命中列表（按归一化分数降序）。
 
+        allowed_ids 非空时只在该 job_id 集合内打分召回（硬约束召回前预筛，与向量通道一致）。
         bm25 原始分数无界，做 max 归一化到 [0,1] 写入 retrieval_score / bm25_score，
         便于纯 BM25 模式下的展示；混合模式只用名次（RRF），归一化不影响融合结果。
         """
@@ -106,9 +94,9 @@ class BM25Corpus:
         max_score = scores[ranked[0]] if ranked else 1.0
         hits = []
         for i in ranked:
+            if allowed_ids is not None and self.ids[i] not in allowed_ids:
+                continue   # 硬约束预筛：不在 eligible 集合的岗位不进 BM25 命中
             metadata = self.metadatas[i] if isinstance(self.metadatas[i], dict) else {}
-            if not _match_where(metadata, where):
-                continue
             norm = float(scores[i] / max_score) if max_score > 0 else 0.0
             hits.append({
                 "job_id": self.ids[i],

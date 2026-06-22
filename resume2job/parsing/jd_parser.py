@@ -18,7 +18,6 @@ from typing import Optional, Any
 from resume2job.core.config import CHAT_MODEL as MODEL_NAME
 from resume2job.core.llm import (
     call_llm as _core_call_llm,
-    clean_llm_json_output,
     safe_json_parse,
 )
 
@@ -27,7 +26,7 @@ from resume2job.core.llm import (
 JSON_SCHEMA_EXAMPLE = {
     "company": "string or null",
     "title": "string or null",
-    "job_type": "实习 / 全职 / 校招 / 日常实习 / 暑期实习 / null",
+    "job_type": "实习 / 校招 / 社招 / null",
     "offers_internship": "true / false / null（该岗位是否提供实习机会）",
     "direction": "大模型算法 / NLP / CV / 推荐 / 后端 / ... / null",
     "business_area": "智能客服 / 搜索推荐 / 多模态 / Agent / RAG / 广告 / 风控 / ... / null",
@@ -38,6 +37,7 @@ JSON_SCHEMA_EXAMPLE = {
     "preferred_skills": ["JD 中出现『优先 / 加分 / 有经验更好』表述的技能"],
     "tools_or_frameworks": ["PyTorch / TensorFlow / LangChain / FAISS / Qwen / Llama ..."],
     "domain_keywords": ["RAG / Agent / SFT / Post-training / 多模态 / 推荐系统 ..."],
+    "required_alternatives": [["Python", "C++"]],  # 「满足其一即可」的必备技能组（命中任一即视为满足）
 
     "education_requirement": "学历要求原文摘要",
     "education_level": "本科 / 硕士 / 博士 / 不限 / null",
@@ -83,7 +83,11 @@ SYSTEM_PROMPT = """你是一名资深招聘分析师和岗位信息结构化专�
 3. 字段缺失时：字符串字段返回 null，列表字段返回 []，布尔字段返回 null，对象字段保留键并内部用 null / [] 填充。
 
 【字段抽取与规范化】
-- job_type：规范化到「实习 / 全职 / 校招 / 日常实习 / 暑期实习」之一，无法判断则 null。
+- job_type：**只能**规范化到「实习 / 校招 / 社招」之一，无法判断则 null：
+  * 暑期实习 / 日常实习 / 寒假实习 / 实习生 → 实习；
+  * 全职 / 正式岗 / 社会招聘 → 社招；
+  * 面向某届毕业生 / 应届 / 校园招聘，且**无任何实习字样** → 校招；
+  * **重要**：含「实习」字样的岗位即使写明「2027届在校生」「面向27届」，仍判为**实习**，不要因「届」误判为校招。
 - offers_internship：布尔字段。当 JD 出现「可提供实习」「接受实习生」「可实习」「实习岗位」等明确表达时为 true；明确说明不接受实习时为 false；未提及则 null。
 - direction：岗位的技术方向（如大模型算法、NLP、CV、推荐算法、数据工程、后端开发等）。
 - business_area：业务场景（如智能客服、搜索推荐、多模态、Agent、RAG、广告、风控）。
@@ -98,13 +102,17 @@ SYSTEM_PROMPT = """你是一名资深招聘分析师和岗位信息结构化专�
 - preferred_skills：JD 中出现「优先 / 加分 / 有经验更好 / 熟悉者优先 / 满足以下任一即可加分」表述的技能。
   * 凡是在「优先」「加分项」「实战经验（满足以下任一即可加分）」等语境下出现的技能，
     一律放入 preferred_skills，**不要**作为 hard_skills 必备技能，以免拉低匹配分。
-- tools_or_frameworks：具体的工具 / 框架 / 平台 / 模型名称（如 PyTorch、LangChain、Qwen）。
+- tools_or_frameworks：具体的工具 / 框架 / 平台 / 模型名称（如 PyTorch、LangChain、Qwen）。注意这类多为通用基础能力，不要默认当成核心必备方向技能。
 - domain_keywords：领域 / 范式关键词（如 RAG、Agent、SFT、多模态），不要混入工具名。
+- required_alternatives：**可替代必备技能组**——当 JD 要求「满足其一即可」（如「Python / C++ 其一」「熟悉 ROS 或 SLAM 其中之一」）时，
+  把该组的原子技能作为一个子列表放入（如 [["Python","C++"]]）；同时仍把各原子分别列入 hard_skills。
+  普通「都要满足」的并列必备技能（如「深度学习及强化学习」）**不要**放入本字段。无此类要求时为 []。
 - **严禁**将「学习能力 / 责任心 / 抗压能力 / 团队协作 / 沟通能力」放入 hard_skills。
 - **严禁**将论文 / 会议 / 专利要求放入 hard_skills，必须放入 academic_requirements。
 - **严禁**将竞赛 / 获奖要求放入 hard_skills，必须放入 competition_requirements。
 
 - education_level：必须规范化到「本科 / 硕士 / 博士 / 不限 / null」；「本科及以上」→ 本科，「硕士及以上」→ 硕士。
+  **JD 未明确表述学历要求时返回 null（即无学历要求），不要臆造或默认填本科。**
 
 - internship_duration：**只能填写明确的实习时长或到岗要求**，例如「3个月以上」「每周至少4天，持续6个月」。
   * 如果原文只出现「可提供实习岗位」「接受实习生」「可实习」等模糊表述而**未明确时长**，则：
@@ -149,6 +157,7 @@ DEFAULT_JD = {
     "preferred_skills": [],
     "tools_or_frameworks": [],
     "domain_keywords": [],
+    "required_alternatives": [],
 
     "education_requirement": None,
     "education_level": None,
@@ -377,9 +386,8 @@ def validate_jd_profile(data: dict) -> dict:
     result["risk_points"] = normalized_risks
 
     # 5) 枚举字段轻量校验
-    job_type_allowed = {"实习", "全职", "校招", "日常实习", "暑期实习"}
-    if result["job_type"] not in job_type_allowed and result["job_type"] is not None:
-        result["job_type"] = None
+    # job_type 归一到三桶 {实习/校招/社招}（暑期/日常实习→实习，全职/正式→社招）；未知→None 交 infer 兜底
+    result["job_type"] = _normalize_job_type(result["job_type"])
     education_allowed = {"本科", "硕士", "博士", "不限"}
     if result["education_level"] not in education_allowed and result["education_level"] is not None:
         result["education_level"] = None
@@ -392,6 +400,19 @@ def validate_jd_profile(data: dict) -> dict:
                 "tools_or_frameworks", "domain_keywords", "benefits", "highlights",
                 "academic_requirements", "competition_requirements", "evidence"):
         result[key] = _dedup_keep_order(result.get(key, []))
+
+    # 7) required_alternatives：规范化为「list of list[str]」，仅保留 ≥2 个原子的有效组
+    raw_alts = result.get("required_alternatives")
+    alt_groups = []
+    if isinstance(raw_alts, list):
+        for grp in raw_alts:
+            if not isinstance(grp, list):
+                continue
+            atoms = _dedup_keep_order([str(x).strip() for x in grp
+                                       if isinstance(x, (str, int, float)) and str(x).strip()])
+            if len(atoms) >= 2:
+                alt_groups.append(atoms)
+    result["required_alternatives"] = alt_groups
 
     return result
 
@@ -569,6 +590,61 @@ def split_compound_skill(skill: str) -> list:
     return _dedup_keep_order(results)
 
 
+# 「满足其一即可」的可替代必备信号词（区别于「及/和/与」这类「都要」并列）
+_ALT_REQUIREMENT_SIGNALS = ("其一", "任一", "二选一", "二选其一", "任选", "之一", "其中之一", "任意一")
+# 技能描述常见前缀动词（如「熟悉 ROS」→「ROS」），拆分后剥离
+_SKILL_LEAD_PREFIXES = ("熟悉", "掌握", "了解", "精通", "熟练", "具备", "拥有", "熟练掌握", "有")
+
+
+def _strip_leading_prefix(atom: str) -> str:
+    """剥离技能原子的前缀动词（熟悉/掌握/了解…），兼容带空格与中文紧贴两种写法。"""
+    s = atom.strip()
+    changed = True
+    while changed:
+        changed = False
+        for p in sorted(_SKILL_LEAD_PREFIXES, key=len, reverse=True):
+            if s.startswith(p) and len(s) > len(p):
+                s = s[len(p):].strip()
+                changed = True
+                break
+    return s
+
+
+def normalize_alternative_groups(data: dict) -> dict:
+    """规则兜底：从 hard_skills 原始条目识别『满足其一』组，补入 required_alternatives，
+    并把该条目替换为清洗后的原子（去掉「其一/或」等信号），供后续 normalize_jd_skills 干净原子化。
+
+    必须在 normalize_jd_skills（原子化）之前调用——此时 hard_skills 仍可能含「Python/C++ 其一」整句。
+    LLM 已正确填 required_alternatives 时本函数只做去重补充，不会重复添加。
+    """
+    existing = [g for g in (data.get("required_alternatives") or []) if isinstance(g, list)]
+    seen_keys = {frozenset(a.strip().lower() for a in g) for g in existing}
+    groups = list(existing)
+
+    new_hard = []
+    for raw in list(data.get("hard_skills") or []):
+        if isinstance(raw, str) and any(sig in raw for sig in _ALT_REQUIREMENT_SIGNALS):
+            cleaned = raw
+            # 信号词按长度从长到短替换，避免「之一」先吃掉「其中之一」残留「其中」
+            for sig in sorted(_ALT_REQUIREMENT_SIGNALS, key=len, reverse=True):
+                cleaned = cleaned.replace(sig, " ")
+            cleaned = cleaned.replace("或", "/")  # 「ROS 或 SLAM」→ 可被分隔符拆分
+            atoms = [a for a in (_strip_leading_prefix(x) for x in split_compound_skill(cleaned)) if a]
+            atoms = _dedup_keep_order(atoms)
+            if len(atoms) >= 2:
+                key = frozenset(a.strip().lower() for a in atoms)
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    groups.append(atoms)
+                new_hard.extend(atoms)  # 用清洗后的原子替换原句，避免「C++ 其一」污染 hard_skills
+                continue
+        new_hard.append(raw)
+
+    data["hard_skills"] = _dedup_keep_order(new_hard)
+    data["required_alternatives"] = groups
+    return data
+
+
 def _has_preferred_signal(text: str) -> bool:
     """判断一条技能描述是否带「优先 / 加分」语义。"""
     return any(w in text for w in _PREFERRED_SIGNAL_WORDS)
@@ -671,55 +747,132 @@ def normalize_risk_points(data: dict) -> dict:
     return data
 
 
-# ===== 规则后处理 4：job_type 推断 =====
-# 正式岗位特征：薪资范围 / 经验要求 N-M 年 / 年限要求
+# ===== 规则后处理 4：job_type 推断（统一三桶：实习 / 校招 / 社招）=====
+# 正式（社招）岗位特征：月薪范围（如 20k-25k / 月薪 1.5万）/ 经验年限 / 五险一金等
 _FULLTIME_SIGNAL_PATTERNS = [
     r"薪资范围",
-    r"\d+\s*[-~]\s*\d+\s*K",
+    r"月薪",
+    r"\d+\s*[-~]\s*\d+\s*[kK]",        # 20k-25k / 20K-25K
+    r"\d+\s*[kK]\s*[-~]\s*\d+\s*[kK]", # 20k - 25k（两侧都带 k）
     r"经验要求.*\d+\s*[-~]?\s*\d*\s*年",
     r"\d+\s*年.*经验",
     r"五险一金",
     r"正式员工",
+    r"社招",
 ]
-_INTERN_TYPE_PATTERNS = [
-    (r"日常实习", "日常实习"),
-    (r"暑期实习", "暑期实习"),
-    (r"寒假实习", "实习"),
-    (r"校招", "校招"),
-]
+# 实习信号词：出现即倾向实习（实习字样优先于「届/应届」，如『2027届暑期实习』仍为实习）
+_INTERN_KEYWORDS = ("实习", "暑期实习", "日常实习", "寒假实习", "intern")
+# 校招信号：校园招聘 / 应届 / N届 / 毕业生（在**无实习字样**时才判为校招）
+_CAMPUS_PATTERNS = [r"校招", r"校园招聘", r"应届", r"\d{2,4}\s*届", r"毕业生"]
+
+# 各类别名 → 三桶规范形。注意：「全职/正式」**不**在此——正式岗未必是社招（招应届的全职岗=校招），
+# 由 infer_job_type 先查校招信号（届/应届）再归社招，避免把校招全职岗误判成社招。
+_JOB_TYPE_ALIASES = {
+    "实习": "实习", "暑期实习": "实习", "日常实习": "实习", "寒假实习": "实习", "intern": "实习",
+    "校招": "校招", "校园招聘": "校招",
+    "社招": "社招",
+}
+# 「正式岗」弱信号（非校招即社招）：infer_job_type 据此在无校招信号时归社招。
+_FULLTIME_HINTS = {"全职", "正式", "正式员工", "正式岗", "正式岗位"}
+
+
+def _normalize_job_type(jt) -> Optional[str]:
+    """把任意 job_type 表述归一到三桶 {实习 / 校招 / 社招}；未知或空 → None。"""
+    if not isinstance(jt, str) or not jt.strip():
+        return None
+    return _JOB_TYPE_ALIASES.get(jt.strip(), None)
 
 
 def infer_job_type(data: dict, jd_text: str) -> dict:
-    """根据 JD 原文 + 已有字段推断 job_type / offers_internship。"""
+    """推断 job_type 到三桶 {实习 / 校招 / 社招}，优先级（scenario_overview §2.1 / 解析建议 §3）：
+        ① LLM 已抽到三桶之一（实习/校招/社招）→ 直接信任；
+        ②「全职/正式」岗（非三桶）→ 只在校招/社招间判：有校招信号(届/应届)→校招，否则社招（**绝不实习**）；
+        ③ LLM 未抽 → 规则推断：实习字样 > 校招信号(届/应届/校园招聘) > 社招信号(月薪/年限) > 默认实习。
+    实习字样优先于「届」：『2027届 + 暑期实习』→实习；『2027届』(无实习字样)→校招；
+    『全职 + 2027届』→校招（招应届的全职岗是校招，不因「全职」误判社招）。
+    """
     text = jd_text or ""
+    raw = str(data.get("job_type") or "").strip()
+    jt = _normalize_job_type(raw)  # ① LLM 明述三桶（实习/校招/社招）则直接信任
 
-    # 1) 明确的实习类型关键词优先
-    for pat, jt in _INTERN_TYPE_PATTERNS:
-        if re.search(pat, text):
-            # 若已经是更具体的类型则不覆盖；否则赋值
-            if data.get("job_type") is None or data["job_type"] == "实习":
-                data["job_type"] = jt
-            # 暑期 / 日常 实习意味着提供实习
-            if jt in {"实习", "日常实习", "暑期实习"}:
-                if data.get("offers_internship") is not True:
-                    data["offers_internship"] = True
-            break
-
-    # 2) 正式岗位特征：若文本含薪资范围 / 经验年限等，job_type 倾向于全职
-    has_fulltime_signal = any(re.search(p, text) for p in _FULLTIME_SIGNAL_PATTERNS)
-    has_internship_signal = (
+    has_intern = (
         data.get("offers_internship") is True
+        or any(kw in text for kw in _INTERN_KEYWORDS)
         or any(re.search(p, text) for p in INTERNSHIP_VAGUE_PATTERNS)
     )
+    has_campus = any(re.search(p, text) for p in _CAMPUS_PATTERNS)
+    has_fulltime = any(re.search(p, text) for p in _FULLTIME_SIGNAL_PATTERNS)
 
-    if data.get("job_type") is None and has_fulltime_signal:
-        data["job_type"] = "全职"
+    if jt is None:
+        if raw in _FULLTIME_HINTS:
+            # ②「全职/正式」岗：只在校招/社招间判（**绝不实习**；可提供实习只置 offers_internship）
+            jt = "校招" if has_campus else "社招"
+        elif has_intern:
+            jt = "实习"   # ③ 真未知：实习字样 > 校招(届) > 社招(月薪/年限) > 默认实习
+        elif has_campus:
+            jt = "校招"
+        elif has_fulltime:
+            jt = "社招"
+        else:
+            jt = "实习"
 
-    # 3) 出现"可提供实习"模糊表达时，offers_internship 至少为 True
-    if has_internship_signal and data.get("offers_internship") is None:
+    data["job_type"] = jt
+    # 实习类岗位标记 offers_internship（正式岗的「可提供实习」已在归一阶段置过）
+    if jt == "实习" and has_intern and data.get("offers_internship") is None:
         data["offers_internship"] = True
-
     return data
+
+
+# ===== 硬约束派生字段（供召回前 eligibility 预过滤；入库时算好存 jobs 列）=====
+# 学历分级（单一事实源；match_scorer 也 import 此表，避免两份漂移）。专科/大专同档。
+DEGREE_RANK = {"专科": 1, "大专": 1, "本科": 2, "硕士": 3, "博士": 4}
+
+
+def normalize_job_type(jt, default: str = "实习") -> str:
+    """把岗位类型表述归一到三桶 {实习/校招/社招}；未知/空 → default（默认实习）。"""
+    return _normalize_job_type(jt) or default
+
+
+def degree_min_rank_and_status(education_level):
+    """由 JD 学历要求得 (min_degree_rank, education_status)：
+        本科/硕士/博士 → (1/2/3, 'explicit')；不限 → (None, 'unrestricted')；
+        空 / 无法识别（如「硕士优先」未抽成档）→ (None, 'unknown')。
+    预过滤时 unrestricted / unknown 一律保留（不卡），仅 explicit 且高于候选人学历才过滤。
+    """
+    lvl = (str(education_level).strip() if education_level else "")
+    if not lvl:
+        return None, "unknown"
+    if lvl == "不限":
+        return None, "unrestricted"
+    rank = DEGREE_RANK.get(lvl)
+    if rank is None:
+        return None, "unknown"
+    return rank, "explicit"
+
+
+def derive_constraint_fields(jd_profile: dict) -> dict:
+    """从 jd_profile 算出召回前 eligibility 预过滤要用的硬约束列（入库 / 回填时写 jobs 表）。
+
+    返回 {cities_json, city_status, job_types_json, min_degree_rank, education_status}：
+      - cities_json   ：规范化城市数组（job_cities，多城市岗多个）；空 → city_status=unknown（保留+待确认）；
+      - job_types_json：岗位类型数组（job_type 单值 + offers_internship 则并入「实习」）；
+      - min_degree_rank / education_status：见 degree_min_rank_and_status。
+    """
+    if not isinstance(jd_profile, dict):
+        jd_profile = {}
+    cities = job_cities(jd_profile)
+    jt = _normalize_job_type(jd_profile.get("job_type"))  # 全职→社招、实习生→实习 等归一三桶；未知→None
+    job_types = [jt] if jt else []
+    if jd_profile.get("offers_internship") and "实习" not in job_types:
+        job_types.append("实习")
+    min_rank, edu_status = degree_min_rank_and_status(jd_profile.get("education_level"))
+    return {
+        "cities_json": cities,
+        "city_status": "explicit" if cities else "unknown",
+        "job_types_json": job_types,
+        "min_degree_rank": min_rank,
+        "education_status": edu_status,
+    }
 
 
 # 集团统招 JD（如阿里「在招业务」列表式 JD）常无显式公司名，LLM 偶发抽空。
@@ -743,11 +896,23 @@ def infer_company(data: dict, jd_text: str) -> dict:
 
 
 # ===== 主流程 =====
+def parse_error(stage: str, reason: str) -> dict:
+    """构造可区分的 JD 解析失败结果（区别于「成功但字段缺失」的空列表/null）。
+
+    error_stage ∈ {empty_text(JD 文本为空) / llm_failed(模型调用异常) / parse_failed(输出非合法 JSON)}。
+    """
+    return {"error": reason, "error_stage": stage}
+
+
 def parse_jd(jd_text: str) -> dict:
-    """主流程：LLM 抽取 -> 清洗 -> 解析 -> Schema 补齐 -> 规则后处理。失败返回 {}。"""
+    """主流程：LLM 抽取 -> 清洗 -> 解析 -> Schema 补齐 -> 规则后处理。
+
+    返回值可区分（见 parse_error）：成功=完整 JD 画像 dict（无 error 键，字段缺失体现为空列表/null）；
+    失败=带 error + error_stage 的轻量 dict（JD 空 / 模型异常 / 输出非 JSON），供调用方精确反馈。
+    """
     if not jd_text or not jd_text.strip():
         print("[ERROR] JD 文本为空")
-        return {}
+        return parse_error("empty_text", "JD 文本为空")
 
     # 步骤 1：LLM 抽取
     user_prompt = build_user_prompt(jd_text)
@@ -755,23 +920,25 @@ def parse_jd(jd_text: str) -> dict:
         raw_output = call_llm(SYSTEM_PROMPT, user_prompt)
     except Exception as e:
         print(f"[ERROR] LLM 调用失败：{e}")
-        return {}
+        return parse_error("llm_failed", f"JD 解析模型调用失败：{e}")
 
     # 步骤 2：清洗 + JSON 解析
     parsed = safe_json_parse(raw_output)
     if parsed is None:
-        return {}
+        print("[ERROR] JD 解析模型输出无法解析为合法 JSON")
+        return parse_error("parse_failed", "JD 解析模型输出无法解析为合法 JSON")
 
     # 步骤 3：Schema 默认值补全
     profile = validate_jd_profile(parsed)
 
-    # 步骤 4：规则后处理（顺序：实习字段 → 技能字段 → 技能原子化 → 风险点 → job_type）
+    # 步骤 4：规则后处理（顺序：实习字段 → 技能字段 → 可替代组 → 技能原子化 → 风险点 → job_type）
     profile = normalize_internship_fields(profile)
     profile = normalize_skills(profile)
-    profile = normalize_jd_skills(profile)  # 拆分长句技能、分流优先/加分项
+    profile = normalize_alternative_groups(profile)  # 先捕获「满足其一」组，再原子化
+    profile = normalize_jd_skills(profile)           # 拆分长句技能、分流优先/加分项
     profile = normalize_risk_points(profile)
     profile = infer_job_type(profile, jd_text)
-    profile = infer_company(profile, jd_text)  # 集团统招 JD 公司名兜底
+    profile = infer_company(profile, jd_text)        # 集团统招 JD 公司名兜底
 
     return profile
 

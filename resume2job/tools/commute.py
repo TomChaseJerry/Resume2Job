@@ -41,6 +41,7 @@ DEFAULT_TRANSPORT = "transit"
 _MUNICIPALITIES = ["北京", "上海", "天津", "重庆"]
 
 # LLM 接口（意图抽取，统一走 core 层）
+from resume2job.core import config
 from resume2job.core.config import CHAT_MODEL as MODEL_NAME
 from resume2job.core.llm import call_llm as _core_call_llm, clean_llm_json_output as _clean_json
 
@@ -293,11 +294,21 @@ _TRANSPORT_CN = {"transit": "地铁/公交", "driving": "驾车", "walking": "�
 
 def _commute_summary(minutes: Optional[int], within: Optional[bool],
                      transport: str, limit: Optional[int], addr_known: bool,
-                     route: str = "") -> str:
-    """生成面向用户的通勤说明（时长 + 路线），不暴露 API 字段名。"""
+                     route: str = "", reason: Optional[str] = None) -> str:
+    """生成面向用户的通勤说明（时长 + 路线），不暴露 API 字段名。
+
+    reason 区分「地址不可用」的原因，给用户说明清楚（而非笼统失败）：
+      - no_office       ：该岗位 JD 未提供办公地点；
+      - geocode_failed  ：地址过于模糊，高德无法定位；
+      - no_origin       ：用户未提供出发地。
+    """
     mode_cn = _TRANSPORT_CN.get(transport, "地铁/公交")
     if not addr_known:
-        return "办公地址未知，无法计算通勤"
+        return {
+            "no_office": "该岗位 JD 未提供办公地点，无法计算公交/地铁通勤时间与路线",
+            "geocode_failed": "该岗位办公地点描述过于模糊、高德无法定位，无法计算通勤",
+            "no_origin": "未提供出发地，无法计算通勤（请补充出发地）",
+        }.get(reason, "办公地址未知，无法计算通勤")
     if minutes is None:
         return f"{mode_cn}路线无法计算"
     route_part = f"（路线：{route}）" if route else ""
@@ -308,44 +319,18 @@ def _commute_summary(minutes: Optional[int], within: Optional[bool],
     return f"{mode_cn}约 {minutes} 分钟{route_part}"
 
 
-# ===== Prompt 3 等价逻辑：过滤与排序（Python）=====
+# ===== 通勤排序（统一软：不过滤，达标作偏好加分参与重排）=====
 def _rank_jobs(records: list, max_minutes: Optional[int], transport: str) -> dict:
-    """对带通勤时长的岗位做过滤与排序。
+    """计算通勤信息并软重排，**不过滤**任何岗位（岗位相关性优先于通勤）。
 
     records：[{job_id, company, title, final_score, commute_minutes(None=不可计算), addr_known}]
-    规则：
-      - 达标（在上限内）按 final_score 降序排前；
-      - 超标的不丢弃，排到末位；
-      - 若达标不足 3 个，从超标里按分数补足并注明超标；
-      - 地址缺失 / 无法计算的 within_limit=None，排最后。
+    排序：
+      - 给了 max_minutes：达标作偏好命中分，final=(1-α)·相关性 + α·达标，α 小（相关性主导），
+        达标岗位轻微上浮，但不踢掉超标的好岗位；
+      - 未给 max_minutes：保持相关性（final_score）序，仅在报告附通勤时长/路线。
+    地址缺失 / 无法计算的 within_limit=None，commute_summary 注明无法计算。
     """
-    def _score(r):
-        return r.get("final_score") or 0
-
-    available = [r for r in records if r.get("addr_known") and r.get("commute_minutes") is not None]
-    unknown = [r for r in records if not (r.get("addr_known") and r.get("commute_minutes") is not None)]
-
-    if max_minutes is None:
-        # 没有明确上限：全部按通勤时长升序（可计算的在前），不做达标判定
-        within = sorted(available, key=lambda r: r["commute_minutes"])
-        over = []
-    else:
-        within = sorted([r for r in available if r["commute_minutes"] <= max_minutes],
-                        key=_score, reverse=True)
-        over = sorted([r for r in available if r["commute_minutes"] > max_minutes],
-                      key=_score, reverse=True)
-
-    # 达标不足 3 个时，从超标中按分数补足
-    backfilled = []
-    if max_minutes is not None and len(within) < 3 and over:
-        need = 3 - len(within)
-        backfilled = over[:need]
-        over = over[need:]
-
-    ranked_records = within + backfilled
-    filtered_records = over + unknown
-
-    def _to_view(r, rank=None, mark_within=None):
+    def _to_view(r, rank=None):
         minutes = r.get("commute_minutes")
         addr_known = r.get("addr_known")
         if not addr_known or minutes is None:
@@ -362,35 +347,37 @@ def _rank_jobs(records: list, max_minutes: Optional[int], transport: str) -> dic
             "commute_route": r.get("commute_route") or "",
             "within_limit": within_limit,
             "commute_summary": _commute_summary(minutes, within_limit, transport, max_minutes,
-                                                bool(addr_known), route=r.get("commute_route") or ""),
+                                                bool(addr_known), route=r.get("commute_route") or "",
+                                                reason=r.get("unavailable_reason")),
             "final_score": r.get("final_score"),
         }
         if rank is not None:
             view["rank"] = rank
         return view
 
-    ranked_jobs = [_to_view(r, rank=i + 1) for i, r in enumerate(ranked_records)]
-    filtered_out = []
-    for r in filtered_records:
-        v = _to_view(r)
-        v["reason_excluded"] = ("通勤时间超标" if (r.get("addr_known") and r.get("commute_minutes") is not None)
-                                else "办公地址未知，无法计算通勤")
-        filtered_out.append(v)
+    alpha = config.PREF_WEIGHT_ALPHA
+
+    def _sort_key(r):
+        base = (r.get("final_score") or 0) / 100.0          # 相关性归一到 [0,1]
+        if max_minutes is None:
+            return base
+        hit = 1.0 if (r.get("addr_known") and r.get("commute_minutes") is not None
+                      and r["commute_minutes"] <= max_minutes) else 0.0
+        return (1 - alpha) * base + alpha * hit             # 相关性主导，达标加分
+
+    ordered = sorted(records, key=_sort_key, reverse=True)
+    ranked_jobs = [_to_view(r, rank=i + 1) for i, r in enumerate(ordered)]
 
     total = len(records)
-    qualified = len(within)
-    note_parts = [f"共检索 {total} 个候选岗位"]
     if max_minutes is not None:
-        note_parts.append(f"{qualified} 个通勤达标")
-        if backfilled:
-            note_parts.append(f"{len(backfilled)} 个虽超标但因达标不足已补充")
-        if over:
-            note_parts.append(f"{len(over)} 个超标排至末位")
-    if unknown:
-        note_parts.append(f"{len(unknown)} 个地址缺失无法计算")
-    note = "，".join(note_parts) + "。"
+        within_n = sum(1 for r in records if r.get("addr_known")
+                       and r.get("commute_minutes") is not None and r["commute_minutes"] <= max_minutes)
+        note = (f"共 {total} 个岗位（通勤未过滤，岗位相关性优先）；"
+                f"{within_n} 个通勤在 {max_minutes} 分钟内（已轻微上浮），其余仍保留并标注通勤。")
+    else:
+        note = f"共 {total} 个岗位，已在报告附通勤时长与路线（未按通勤重排）。"
 
-    return {"ranked_jobs": ranked_jobs, "filtered_out": filtered_out, "note": note}
+    return {"ranked_jobs": ranked_jobs, "filtered_out": [], "note": note}
 
 
 # ===== 对外主入口：计算 + 排序 =====
@@ -421,7 +408,7 @@ def compute_and_rank(intent: dict, jobs: list) -> dict:
         if not origin:
             error = f"用户住址地理编码失败：{user_address}"
 
-    # 逐岗位计算（若前置失败，则全部记为不可计算）
+    # 逐岗位计算（若前置失败，则全部记为不可计算，并记明原因供用户说明）
     records = []
     geocode_cache: dict = {}
     for job in jobs or []:
@@ -430,13 +417,19 @@ def compute_and_rank(intent: dict, jobs: list) -> dict:
         minutes = None
         route = ""
         addr_known = bool(office)
+        unavailable_reason = None
 
-        if origin and api_key and addr_known:
+        if not office:
+            unavailable_reason = "no_office"          # 该岗位 JD 未提供办公地点
+        elif not origin or not api_key:
+            unavailable_reason = "no_origin" if not origin else None  # 用户出发地缺失 / 无 Key
+        else:
             dest = amap_geocode(office, job_city, api_key, geocode_cache)
             if dest:
                 minutes, route = amap_route(origin, dest, transport, job_city, api_key)
             else:
-                addr_known = False  # 目的地无法编码，等同地址不可用
+                addr_known = False                    # 目的地无法编码，等同地址不可用
+                unavailable_reason = "geocode_failed"
 
         records.append({
             "job_id": job.get("job_id"),
@@ -446,6 +439,7 @@ def compute_and_rank(intent: dict, jobs: list) -> dict:
             "commute_minutes": minutes,
             "commute_route": route,
             "addr_known": addr_known,
+            "unavailable_reason": unavailable_reason,
         })
 
     ranked = _rank_jobs(records, max_minutes, transport)
@@ -552,10 +546,12 @@ def offline_test():
         {"job_id": "C", "company": "丙", "title": "实习", "final_score": 0.7, "commute_minutes": None, "addr_known": False},
     ]
     ranked = _rank_jobs(records, 60, "transit")
-    check("达标排首位", ranked["ranked_jobs"][0]["job_id"], "A")
-    check("超标补足进入 ranked（不足3个）", [j["job_id"] for j in ranked["ranked_jobs"]], ["A", "B"])
-    check("地址未知被过滤", ranked["filtered_out"][0]["job_id"], "C")
-    check("过滤原因", ranked["filtered_out"][0]["reason_excluded"], "办公地址未知，无法计算通勤")
+    check("不过滤：全部保留", len(ranked["ranked_jobs"]), 3)
+    check("filtered_out 恒空（不过滤）", ranked["filtered_out"], [])
+    check("达标的 A 在首位（达标加分+相关性主导）", ranked["ranked_jobs"][0]["job_id"], "A")
+    by_id = {j["job_id"]: j for j in ranked["ranked_jobs"]}
+    check("超标岗位仍保留并标 within_limit=False", by_id["B"]["within_limit"], False)
+    check("地址未知 within_limit=None", by_id["C"]["within_limit"], None)
 
     print("== compute_and_rank（无 AMAP_API_KEY 兜底）==")
     saved_key = os.environ.pop("AMAP_API_KEY", None)

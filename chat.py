@@ -99,17 +99,19 @@ def _print_assistant(final_state: dict) -> None:
         if len(match_results) == 1:
             mr = match_results[0]
             jd = mr.get("jd_profile") or {}
-            score = (mr.get("match_score") or {}).get("final_score")
-            print(f"  【{jd.get('company', '?')} - {jd.get('title', '?')}】匹配度 {score}")
+            score = (mr.get("match_score") or {}).get("rank_score")
+            print(f"  【{jd.get('company', '?')} - {jd.get('title', '?')}】推荐分 {score}"
+                  f"（岗位 ID：{mr.get('job_id')}）")
             report = (mr.get("report") or "").strip()
             if report:
                 print("\n  " + report.replace("\n", "\n  "))
         else:
-            print(f"  为你匹配到 {len(match_results)} 个岗位：")
+            print(f"  为你匹配到 {len(match_results)} 个岗位（追问某岗请指明岗位 ID）：")
             for i, mr in enumerate(match_results[:5], 1):
                 jd = mr.get("jd_profile") or {}
-                score = (mr.get("match_score") or {}).get("final_score")
-                print(f"    {i}. {jd.get('company', '?')} - {jd.get('title', '?')}（匹配度 {score}）")
+                score = (mr.get("match_score") or {}).get("rank_score")
+                print(f"    {i}. [{mr.get('job_id')}] {jd.get('company', '?')} - "
+                      f"{jd.get('title', '?')}（推荐分 {score}）")
             top = match_results[0]
             report = (top.get("report") or "").strip()
             if report:

@@ -14,7 +14,7 @@ agent/graph.py
 主流程：
     START
       ↓
-    planner（Function Calling：task_type + 检索过滤 + 通勤意图，规则兜底）
+    planner（Function Calling：intent + job_source + assist_actions + 硬约束 + 通勤，规则兜底）
       ↓
     resume_parser -> profile_cache（复用缓存画像 / 保存新画像）
       ↓ (条件路由 route_job_source)
@@ -31,11 +31,13 @@ agent/graph.py
 """
 
 import argparse
+import time
 
 from langgraph.graph import StateGraph, START, END
 
 from resume2job.agent.state import AgentState, get_initial_state
-from resume2job.agent.nodes.planner import planner_node
+from resume2job.agent.trace import TurnTrace, summarize_state, changed_keys
+from resume2job.agent.planner import planner_node
 from resume2job.agent.nodes.executor import (
     resume_parser_node,
     job_retriever_node,
@@ -46,7 +48,7 @@ from resume2job.agent.nodes.executor import (
 from resume2job.agent.nodes.enhancements import enhancement_node
 from resume2job.storage.profile_cache import profile_cache_node
 from resume2job.storage.jd_ingest import jd_ingest_node
-from resume2job.storage import conversation_store
+from resume2job.storage import conversation_store, session_store
 
 
 # ---------------------------------------------------------------------------
@@ -58,16 +60,24 @@ def route_job_source(state: AgentState) -> str:
     岗位来源路由函数（不是节点，只读 state、只返回路由标签，不修改 state）。
 
     根据 plan 决定 profile_cache 之后走向哪条分支：
-        - 需要检索岗位        -> job_retriever
-        - 用户直接粘贴 JD     -> jd_input
-        - 需要解析/评分/推荐  -> jd_analyzer
-        - 其余                -> end
+        - 候选池复用/换一批/SELECTED/ASSIST -> match_scorer（直达，不重检索/不重评分）
+        - 需要检索岗位                      -> job_retriever
+        - 用户直接粘贴 JD                   -> jd_input
+        - 需要解析/评分/推荐                -> jd_analyzer
+        - 澄清/其余                         -> end
 
-    返回值只能是：job_retriever / jd_input / jd_analyzer / end
+    返回值只能是：match_scorer / job_retriever / jd_input / jd_analyzer / end
     """
     plan = state.get("plan")
     if not plan:
         return "end"
+    # 澄清短路：planner 判定需追问时不跑任何业务节点，直达 END（final_response 已设澄清问题）
+    if plan.get("clarify"):
+        return "end"
+    # 候选池复用（换一批 / 重排）+ SELECTED/ASSIST（match_results 已由 planner 注入）：
+    # 直达 match_scorer（不重检索/不重评分），再走 enhancements
+    if plan.get("reuse_pool") or plan.get("next_batch"):
+        return "match_scorer"
     if plan.get("need_job_search"):
         return "job_retriever"
     if plan.get("need_jd_input"):
@@ -111,6 +121,7 @@ def build_graph():
             "job_retriever": "job_retriever",
             "jd_input": "jd_input",
             "jd_analyzer": "jd_analyzer",
+            "match_scorer": "match_scorer",   # 候选池复用 / SELECTED / ASSIST 直达评分节点
             "end": END,
         },
     )
@@ -145,11 +156,11 @@ def _summarize_response(final_state: AgentState) -> str:
         lines = []
         for mr in match_results[:3]:
             jd = mr.get("jd_profile") or {}
-            score = (mr.get("match_score") or {}).get("final_score")
+            score = (mr.get("match_score") or {}).get("rank_score")
             company = jd.get("company") or "未知公司"
             title = jd.get("title") or "未知岗位"
-            lines.append(f"{company} - {title}（匹配度 {score}）")
-        parts.append("为你匹配到以下岗位：\n" + "\n".join(lines))
+            lines.append(f"[{mr.get('job_id')}] {company} - {title}（推荐分 {score}）")
+        parts.append("为你匹配到以下岗位（追问某岗请指明方括号内的岗位 ID）：\n" + "\n".join(lines))
 
     # 3. 纯技能差距分析摘要（skill_gap_only：无 match_results 时）
     skill_gaps = final_state.get("skill_gaps") or []
@@ -162,14 +173,54 @@ def _summarize_response(final_state: AgentState) -> str:
             summary += f"重点建议：{top}"
         parts.append(summary)
 
-    # 4. 学习计划一句话（若有）
+    # 4. ASSIST：学习计划 / 面试练习题一句话（若有）
     plan = final_state.get("learning_plan") or {}
     if plan.get("overall_suggestion"):
         parts.append("学习建议：" + plan["overall_suggestion"])
+    interview = final_state.get("interview_prep") or {}
+    if interview.get("questions"):
+        parts.append(f"已生成 {len(interview['questions'])} 道岗位定制面试练习题。")
 
     if not parts:
         return "本轮未生成岗位结果。"
     return "\n\n".join(parts)
+
+
+def _persist_session(session_id: str, final_state: AgentState) -> None:
+    """把本轮结果写入会话短期状态，供下一轮指代解析、换一批/重排与硬约束变化判定。
+
+    存：
+      - last_results：本轮**展示**的岗位轻量列表 [{rank, job_id, title, city}]，喂下一轮 planner 指代；
+      - candidate_pool：完整已评分候选池（含未展示），供 SELECTED/ASSIST 读详情、换一批、重排；
+      - shown_job_ids：已展示 job_id（换一批从未展示中取）；
+      - active_hard_constraints / active_direction_tags：会话活跃约束/偏好，供 policy 判定「硬约束是否变化」。
+    SELECTED/ASSIST 轮（selected_item_ref 非空）不覆盖列表/池，避免把多岗位压成单条。
+    """
+    if not session_id or final_state.get("selected_item_ref"):
+        return
+    mrs = final_state.get("match_results") or []
+    if not mrs:
+        return
+    last_results = []
+    for i, mr in enumerate(mrs, start=1):
+        jd = mr.get("jd_profile") or {}
+        loc = jd.get("location") or {}
+        last_results.append({"rank": i, "job_id": mr.get("job_id"),
+                             "title": jd.get("title"), "city": loc.get("city")})
+
+    pool = final_state.get("candidate_pool") or mrs
+    rc = final_state.get("retrieval_config") or {}
+    sess = session_store.get_session(session_id)
+    sess["last_results"] = last_results
+    sess["candidate_pool"] = pool              # 整池（含未展示）：SELECTED/ASSIST 读详情、换一批、重排复用
+    sess["shown_job_ids"] = final_state.get("shown_job_ids") or [r.get("job_id") for r in mrs]
+    sess["active_hard_constraints"] = {
+        "city": rc.get("city_filter"),
+        "education": rc.get("education_filter"),
+        "job_type": rc.get("job_type_filter"),
+    }
+    sess["active_direction_tags"] = list((final_state.get("preference_tags") or {}).keys())
+    session_store.set_session(session_id, sess)
 
 
 def run_turn(
@@ -180,7 +231,6 @@ def run_turn(
     jd_text=None,
     top_k: int = 5,
     city_filter=None,
-    direction_filter=None,
     education_filter=None,
 ) -> AgentState:
     """执行一轮多轮对话：
@@ -200,7 +250,6 @@ def run_turn(
         jd_text=jd_text,
         top_k=top_k,
         city_filter=city_filter,
-        direction_filter=direction_filter,
         education_filter=education_filter,
         session_id=session_id,
         messages=history,
@@ -208,10 +257,73 @@ def run_turn(
 
     final_state = app.invoke(initial_state)
 
-    # 记录本轮对话（user + assistant）
+    # 记录本轮对话（user + assistant）+ 写会话短期状态（供下一轮指代）
     response = _summarize_response(final_state)
     conversation_store.append_turn(session_id, user_query, response)
+    _persist_session(session_id, final_state)
     return final_state
+
+
+def run_turn_traced(
+    app,
+    user_query: str,
+    session_id: str = conversation_store.DEFAULT_SESSION_ID,
+    pdf_path=None,
+    jd_text=None,
+    top_k: int = 5,
+    city_filter=None,
+    education_filter=None,
+):
+    """与 run_turn 等价的执行，但额外返回逐节点链路 trace（回归测试 / 调试用）。
+
+    实现上用 app.stream(stream_mode="updates") 替代 app.invoke：LangGraph 在每个节点
+    执行后吐出 {node_name: 该节点返回的产物}。本函数据此：
+        1. 累加产物还原完整 final_state（节点均返回整份 State，累加无副作用）；
+        2. 对每个节点 diff 出改动字段，连同关键信号快照、耗时、新增错误记入 TurnTrace。
+    节点本身零改动。返回 (final_state, trace)。
+
+    trace_id 取 f"{session_id}#{轮次}"，轮次由已有对话历史推算（每轮 = user+assistant 两条）。
+    """
+    history = conversation_store.load_history(session_id)
+
+    initial_state = get_initial_state(
+        user_query=user_query,
+        pdf_path=pdf_path,
+        jd_text=jd_text,
+        top_k=top_k,
+        city_filter=city_filter,
+        education_filter=education_filter,
+        session_id=session_id,
+        messages=history,
+    )
+
+    turn_no = len(history) // 2 + 1
+    trace = TurnTrace(f"{session_id}#{turn_no}", session_id, user_query)
+
+    final_state = dict(initial_state)
+    last_t = time.time()
+    for chunk in app.stream(initial_state, stream_mode="updates"):
+        now = time.time()
+        # 线性图通常每个 chunk 只含一个节点；并行 super-step 会含多个，统一遍历
+        for node_name, node_out in chunk.items():
+            prev = final_state
+            merged = {**prev, **(node_out or {})}
+            prev_errs = prev.get("errors") or []
+            cur_errs = merged.get("errors") or []
+            trace.record(
+                node=node_name,
+                elapsed_s=now - last_t,
+                changed=changed_keys(prev, merged),
+                summary=summarize_state(merged),
+                errors_added=cur_errs[len(prev_errs):],
+            )
+            final_state = merged
+        last_t = now
+
+    response = _summarize_response(final_state)
+    conversation_store.append_turn(session_id, user_query, response)
+    _persist_session(session_id, final_state)
+    return final_state, trace
 
 
 # ---------------------------------------------------------------------------
@@ -225,9 +337,8 @@ def main():
     parser.add_argument("--pdf_path", default=None, help="简历 PDF 路径")
     parser.add_argument("--jd_file", default=None, help="JD 原文文件路径（UTF-8）")
     parser.add_argument("--top_k", type=int, default=5, help="召回岗位数量")
-    parser.add_argument("--city", default=None, help="城市过滤条件")
-    parser.add_argument("--direction", default=None, help="岗位方向过滤条件")
-    parser.add_argument("--education", default=None, help="学历过滤条件")
+    parser.add_argument("--city", default=None, help="城市硬约束")
+    parser.add_argument("--education", default=None, help="学历硬约束")
     parser.add_argument("--session_id", default=conversation_store.DEFAULT_SESSION_ID,
                         help="会话 ID（同一 ID 跨次运行共享对话历史，实现多轮记忆）")
     args = parser.parse_args()
@@ -248,7 +359,6 @@ def main():
         jd_text=jd_text,
         top_k=args.top_k,
         city_filter=args.city,
-        direction_filter=args.direction,
         education_filter=args.education,
     )
 

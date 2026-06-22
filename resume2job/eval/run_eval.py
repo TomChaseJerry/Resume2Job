@@ -22,8 +22,7 @@ def _judge_end_to_end(resume_json: str, jd_file: str) -> None:
     """对一条「简历 × JD」跑完整评分 + 报告生成，再交给 judge 打分。"""
     from resume2job.parsing.jd_parser import parse_jd
     from resume2job.scoring.match_scorer import score_match
-    from resume2job.scoring.skill_gap import analyze_skill_gap
-    from resume2job.generation.recommendation import generate_full_report
+    from resume2job.generation.recommendation import generate_report_and_gap
     from resume2job.eval.judge import judge_report
 
     with open(resume_json, "r", encoding="utf-8") as f:
@@ -33,12 +32,13 @@ def _judge_end_to_end(resume_json: str, jd_file: str) -> None:
 
     print("[run_eval] 解析 JD ...")
     jd_profile = parse_jd(jd_text)
+    if not jd_profile or jd_profile.get("error"):
+        print(f"[run_eval] JD 解析失败：{jd_profile.get('error') if isinstance(jd_profile, dict) else '结果为空'}")
+        return
     print("[run_eval] 匹配评分 ...")
     match_score = score_match(resume_profile, jd_profile)
-    print("[run_eval] 技能差距分析 ...")
-    skill_gap = analyze_skill_gap(resume_profile, jd_profile, match_score)
-    print("[run_eval] 生成推荐报告 ...")
-    report = generate_full_report(jd_profile, match_score, skill_gap)
+    print("[run_eval] 技能差距 + 推荐报告（合并一次 LLM 调用）...")
+    report, skill_gap, _writer = generate_report_and_gap(resume_profile, jd_profile, match_score)
 
     print("\n----- 推荐报告 -----\n" + report)
     print("\n[run_eval] LLM-as-judge 评审 ...")

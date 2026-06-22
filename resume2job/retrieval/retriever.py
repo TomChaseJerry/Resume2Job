@@ -5,8 +5,14 @@
 输出：Top-K 候选岗位列表，供后续 Match Scorer 精排。
 
 三段式架构（召回 → 融合粗排 → 精排）：
-    1. Query 改写：LLM 根据用户画像生成 3 个不同侧重的检索 Query
-       （技能 / 项目 / 求职意向），失败时规则兜底；
+    1. 多 Query 改写（scenario_overview.md §3）：
+       - Query1（方向标签）：用户高层能力方向（搜广推 / 后训练 / 大模型应用…）；
+       - Query2（实践细节）：项目 / 实习实际任务与技术实践（SFT / DPO / RAG / 多路召回…）；
+       Query1/Query2 由 LLM 据画像生成，失败时规则兜底；
+       - Query3（方向偏好，**仅在有明确偏好时生成**）：表达用户「想做什么方向」，
+         来源优先级＝当前输入显式方向偏好（preferences） > 简历求职意向（intentions），
+         两者皆无则不生成。Query3 不承载城市/学历/岗位类型等硬约束，只增强目标方向召回；
+       通用基础能力（Python/PyTorch/Linux…）不进任何 Query。
     2. 双通道召回（mode=hybrid，默认）：
        - 向量通道：query embedding 在本地 ChromaDB（data/chroma_db, collection=jobs）语义检索；
        - BM25 通道：jieba 分词 + BM25Okapi 关键词检索（同一份 index_text 语料）；
@@ -15,11 +21,13 @@
     4. rerank 精排（use_rerank，默认开）：gte-rerank 交叉编码器对头部候选重排；
     5. 截断 Top-K 返回。
 
-支持 city / direction / education 元数据过滤（两通道一致），过滤为空时逐级降级重试。
+硬约束（城市 / 学历 / 岗位类型）在**召回前**做 eligibility 预筛（jobs_store.get_eligible_jobs 按
+SQLite 派生列资格筛选），得 allowed_job_ids，三路 Query 共用（向量 Chroma where job_id $in、
+BM25 集合过滤）；无 eligible 直接返回空。方向不作硬过滤（仅 Query3 + 评分层 direction_bonus）。
 
 设计取舍：
     - RRF 只依赖名次，BM25（无界分数）与向量相似度（0~1）无需量纲对齐即可融合；
-    - 召回环节追求覆盖率而非精度，因此 per_query_k = top_k * 2，并对过滤做降级兜底；
+    - 硬约束召回前预筛，故 per_query_k = top_k * 2 即可（命中天然只含 eligible，无需扩池兜底）；
     - Query 中的「编程语言 / 框架 / 数据库 / 工具」必须在画像中显式出现，禁止 LLM 凭常识补充；
     - matched_terms 引入轻量同义词表，提升“为什么召回”的解释力；
     - 任意单个 Query / 单通道失败只跳过该路，绝不让整体崩溃；rerank 失败保持原排序。
@@ -37,6 +45,7 @@ import re
 import sys
 import json
 import argparse
+from dataclasses import dataclass
 from typing import Optional
 
 import chromadb
@@ -56,6 +65,26 @@ from resume2job.retrieval.fusion import rrf_fuse
 from resume2job.retrieval.rerank import rerank_hits
 # SQLite 事实源：检索通道只回 job_id + 分数，业务数据在此批量回填（hydration）
 from resume2job.storage import jobs_store
+# 硬约束归一（城市 / 岗位类型）；学历分级 DEGREE_RANK 供节点把候选人学历映射成 rank
+from resume2job.parsing.jd_parser import normalize_city, normalize_job_type, DEGREE_RANK
+
+
+# ===== 请求级硬约束对象（城市 / 学历 / 岗位类型）=====
+@dataclass(frozen=True)
+class HardConstraints:
+    """一次召回请求的硬约束（召回前 eligibility 预筛用）。"""
+    city: Optional[str]               # 规范化城市；None=不限城市
+    user_degree_rank: Optional[int]   # 候选人学历 rank（本1硕2博3）；None=未知（学历不卡）
+    job_type: str                     # 实习 / 校招 / 社招
+
+
+def resolve_hard_constraints(city, user_degree_rank, user_job_type) -> HardConstraints:
+    """把原始入参规整成 HardConstraints（城市去「市」后缀、岗位类型归一三桶、缺省实习）。"""
+    return HardConstraints(
+        city=normalize_city(city) if city else None,
+        user_degree_rank=user_degree_rank,
+        job_type=normalize_job_type(user_job_type) if user_job_type else "实习",
+    )
 
 
 # ===== 模型 / 接口常量 =====
@@ -155,6 +184,12 @@ def _collect_resume_locations(resume_profile: dict) -> list:
     return _dedup_keep_order(locations)
 
 
+def _resume_intentions(resume_profile: dict) -> list:
+    """取简历求职意向（job_preferences.intentions）——Query3 的次优来源。"""
+    job_pref = resume_profile.get("job_preferences") if isinstance(resume_profile.get("job_preferences"), dict) else {}
+    return _dedup_keep_order(_flat_strings(job_pref.get("intentions")))
+
+
 def _collect_resume_skills(resume_profile: dict) -> list:
     """从顶层 skills + skill_groups[].items 汇总技能标签。"""
     skills = _flat_strings(resume_profile.get("skills"))
@@ -216,23 +251,41 @@ def _filter_ungrounded_tech(query_text: str, resume_blob: str) -> str:
     return " ".join(kept)
 
 
-# ===== Query 生成 Prompt =====
-SYSTEM_PROMPT_QUERY = """你是一个招聘搜索引擎 Query 生成器。请根据候选人画像生成适合岗位检索的中文关键词 Query。
+def _strip_general_base_skills(query_text: str) -> str:
+    """无条件剔除通用基础能力词（Python/PyTorch/Linux/...）——区分度低，不进 Query 构造。"""
+    kept = [tok for tok in query_text.split()
+            if tok.strip().lower() not in GENERAL_BASE_SKILLS]
+    return " ".join(kept)
+
+
+# ===== 通用基础能力（不参与 Query 构造）=====
+# 语言 / 框架 / 开发环境等区分度低，许多岗位仅要求其中若干项；若进 Query 会把召回
+# 过度拉向泛算法 / 泛开发岗。这些词无条件从 Query 中剔除，仅在召回后做技能校验
+# （见 job_matching_and_ranking.md §3「通用基础能力处理」）。全部小写。
+GENERAL_BASE_SKILLS = {
+    "python", "pytorch", "torch", "linux", "git", "c", "c++", "sql", "docker",
+    "tensorflow", "tf", "numpy", "pandas",
+}
+
+
+# ===== Query 生成 Prompt（两路：方向标签 / 实践细节）=====
+SYSTEM_PROMPT_QUERY = """你是一个招聘搜索引擎 Query 生成器。请根据候选人画像生成两路不同侧重的中文关键词 Query。
+
+两路 Query 的侧重：
+- query_1（方向标签）：表达候选人的高层能力方向，如搜广推、后训练、大模型应用、强化学习、多模态等；
+- query_2（实践细节）：表达项目 / 实习中实际完成的任务、方法与技术实践，如 SFT、DPO、RAG、多路召回、自动化评测、轨迹规划等。
 
 要求：
 1. 只能输出合法 JSON；
 2. 不要输出 Markdown；
 3. 不要输出解释文字；
-4. 每个 Query 由 6~12 个关键词组成；
-5. 关键词之间用空格分隔；
+4. 每个 Query 由 6~12 个关键词组成，关键词之间用空格分隔；
+5. 允许两路 Query 有少量必要语义重叠，但避免整批关键词重复堆叠；同一术语同时出现在技能与项目中时，
+   query_1 保留方向性表达、query_2 保留更细粒度的实践描述；
 6. 不要编造候选人完全没有依据的技能；
-7. 编程语言、框架、数据库、工具名称必须在候选人画像中显式出现才可使用；不得凭常识补充 Python、PyTorch、TensorFlow、Java、C++、MySQL 等显式技能；
+7. **Python、PyTorch、Linux、Git、C++、SQL、Docker 等语言/框架/开发环境属于通用基础能力，区分度低，禁止写入任何 Query**；
 8. 可以做合理泛化，但只能泛化为“领域 / 能力层级词”，例如：
-   GATv2 → 图神经网络 / GNN；
-   Transformer-MoE → Transformer / 深度学习 / 多模态；
-   LoRA → 参数高效微调；
-   Adapter → 表征对齐；
-   多模态融合 → 多模态算法；
+   GATv2 → 图神经网络 / GNN；Transformer-MoE → 深度学习 / 多模态；LoRA → 参数高效微调；多模态融合 → 多模态算法；
 9. 生成的 Query 应适合在岗位知识库中进行向量检索。"""
 
 
@@ -266,22 +319,19 @@ def build_query_user_prompt(resume_profile: dict) -> str:
     payload_str = json.dumps(payload, ensure_ascii=False, indent=2)
 
     return (
-        "请根据以下候选人画像，生成 3 个不同侧重的岗位检索 Query。\n\n"
+        "请根据以下候选人画像，生成 2 路不同侧重的岗位检索 Query。\n\n"
         "===== 候选人画像 =====\n"
         f"{payload_str}\n\n"
-        "===== 三个 Query 的侧重 =====\n"
-        "query_1（技能侧重）：核心技能、技术栈、框架工具、求职城市；\n"
-        "query_2（项目侧重）：项目关键词、项目技术栈、任务方向、适合的岗位方向；\n"
-        "query_3（求职意向兜底）：求职意向、目标方向、城市、泛化岗位关键词。\n\n"
+        "===== 两路 Query 的侧重 =====\n"
+        "query_1（方向标签）：候选人的高层能力方向（搜广推 / 后训练 / 大模型应用 / 强化学习 / 多模态 等）+ 求职方向；\n"
+        "query_2（实践细节）：项目 / 实习中实际完成的任务、方法与技术实践（SFT / DPO / RAG / 多路召回 / 自动化评测 / 轨迹规划 等）。\n\n"
         "===== 关键约束 =====\n"
-        "编程语言 / 框架 / 数据库 / 工具名称必须在上面画像中显式出现才可写入 Query；\n"
-        "不得凭常识补充画像中没有的 Python / PyTorch / TensorFlow 等显式技能；\n"
-        "项目里的具体技术只能泛化为领域 / 能力词。\n\n"
+        "Python / PyTorch / Linux / Git / C++ / SQL / Docker 等通用基础能力**禁止写入任何 Query**；\n"
+        "项目里的具体技术只能泛化为领域 / 能力词；不得凭常识补充画像中没有的技能。\n\n"
         "===== 输出 JSON Schema =====\n"
         '{\n'
-        '  "query_1": "关键词1 关键词2 关键词3",\n'
-        '  "query_2": "关键词1 关键词2 关键词3",\n'
-        '  "query_3": "关键词1 关键词2 关键词3"\n'
+        '  "query_1": "方向标签关键词...",\n'
+        '  "query_2": "实践细节关键词..."\n'
         '}\n\n'
         "每个 Query 6~12 个关键词，空格分隔，不要标点，不要解释，不要 Markdown，只输出 JSON 本体。"
     )
@@ -301,15 +351,15 @@ def _normalize_query_text(text) -> str:
 
 
 def rule_based_queries(resume_profile: dict) -> dict:
-    """规则兜底：LLM 不可用 / 解析失败时，用画像字段拼出 3 个 Query。
+    """规则兜底：LLM 不可用 / 解析失败时，用画像字段拼出 2 路 Query。
 
     规则兜底只取自画像显式字段，天然满足“无据不生成显式技能”的约束。
+    query_1=方向标签（求职意向 + 技能方向），query_2=实践细节（项目关键词 + 技术栈）。
     """
     skills = _collect_resume_skills(resume_profile)
     project_terms = _collect_project_terms(resume_profile)
     job_pref = resume_profile.get("job_preferences") if isinstance(resume_profile.get("job_preferences"), dict) else {}
     intentions = _flat_strings(job_pref.get("intentions"))
-    locations = _collect_resume_locations(resume_profile)
 
     def _compose(*pools, limit=12) -> str:
         merged, seen = [], set()
@@ -325,37 +375,37 @@ def rule_based_queries(resume_profile: dict) -> dict:
                 break
         return _normalize_query_text(" ".join(merged))
 
-    q1 = _compose(skills, locations, intentions)                 # 技能侧重
-    q2 = _compose(project_terms, skills, intentions)             # 项目侧重
-    q3 = _compose(intentions, locations, skills, project_terms)  # 意向兜底
+    q1 = _compose(intentions, skills)            # 方向标签侧重
+    q2 = _compose(project_terms, skills)         # 实践细节侧重
 
-    # 三条都空时给一个最泛化的兜底，避免完全无法检索
-    if not (q1 or q2 or q3):
-        fallback = _normalize_query_text(" ".join(skills + intentions + locations)) or "算法 工程师 实习"
-        q1 = q2 = q3 = fallback
+    # 两条都空时给一个最泛化的兜底，避免完全无法检索
+    if not (q1 or q2):
+        fallback = _normalize_query_text(" ".join(skills + intentions)) or "算法 工程师 实习"
+        q1 = q2 = fallback
 
     return {
-        "query_1": q1 or q3 or q2,
-        "query_2": q2 or q1 or q3,
-        "query_3": q3 or q1 or q2,
+        "query_1": q1 or q2,
+        "query_2": q2 or q1,
     }
 
 
 def generate_queries(resume_profile: dict, verbose: bool = False) -> dict:
-    """Step 1：调用 LLM 生成 3 个检索 Query；任何失败都规则兜底。
+    """Step 1：调用 LLM 生成 2 个检索 Query（query_1 方向标签 / query_2 实践细节）；任何失败都规则兜底。
+    Query3（方向偏好召回）不在此生成——在 retrieve_jobs 内据 preferences / 简历意向条件构建。
 
-    无论 LLM 还是规则兜底，最终都会剔除“无据可依的显式技能词”。
+    无论 LLM 还是规则兜底，最终都会剔除“无据可依的显式技能词”与通用基础能力。
     verbose=True 时打印 LLM 原始输出，便于调试。
     """
     resume_blob = _build_resume_explicit_blob(resume_profile)
     fallback = rule_based_queries(resume_profile)
 
     def _postprocess(queries: dict) -> dict:
-        """统一规整 + 剔除无据显式技能。"""
+        """统一规整 + 剔除无据显式技能 + 剔除通用基础能力。"""
         out = {}
-        for key in ("query_1", "query_2", "query_3"):
+        for key in ("query_1", "query_2"):
             cleaned = _normalize_query_text(queries.get(key))
             cleaned = _filter_ungrounded_tech(cleaned, resume_blob)
+            cleaned = _strip_general_base_skills(cleaned)
             out[key] = cleaned
         return out
 
@@ -385,11 +435,12 @@ def generate_queries(resume_profile: dict, verbose: bool = False) -> dict:
         print("[WARN] LLM Query 解析失败，使用规则兜底 Query。")
         return fallback
 
-    # 逐条规整 + 剔除无据显式技能；缺失或被清空的 query 用规则兜底补齐
+    # 逐条规整 + 剔除无据显式技能 + 剔除通用基础能力；缺失或被清空的 query 用规则兜底补齐
     result = {}
-    for key in ("query_1", "query_2", "query_3"):
+    for key in ("query_1", "query_2"):
         cleaned = _normalize_query_text(parsed.get(key))
         cleaned = _filter_ungrounded_tech(cleaned, resume_blob)
+        cleaned = _strip_general_base_skills(cleaned)
         result[key] = cleaned if cleaned else fallback.get(key, "")
 
     if not any(result.values()):
@@ -402,87 +453,16 @@ def generate_queries(resume_profile: dict, verbose: bool = False) -> dict:
 def _format_queries(queries: dict) -> str:
     """把最终 Query 排版成多行，便于终端阅读。"""
     lines = ["[INFO] 最终检索 Query："]
-    for key in ("query_1", "query_2", "query_3"):
+    for key in ("query_1", "query_2"):
         lines.append(f"  {key}: {queries.get(key, '')}")
     return "\n".join(lines)
 
 
-# ===== Step 2：metadata 过滤条件构造 =====
-def build_where_filter(city_filter: Optional[str],
-                       direction_filter: Optional[str],
-                       education_filter: Optional[str]) -> Optional[dict]:
-    """构造符合 ChromaDB 语法的 where 过滤条件（不含城市）。
-
-    城市不在此处过滤：岗位可能有多个工作城市，而 Chroma metadata 的 city 是
-    单值标量、where 等值匹配无法表达「用户城市 ∈ 岗位多城市」，会漏召回多城市岗位。
-    因此城市改为检索回填后用 jd_profile.location.cities 做 Python post-filter
-    （见 retrieve_jobs 的 _city_match）。此处只处理方向 / 学历。
-
-    - 单条件直接 {field: value}；多条件用 {"$and": [...]}；
-    - 无任何条件返回 None（表示不传 where）。
-    """
-    conditions = []
-    if direction_filter and str(direction_filter).strip():
-        conditions.append({"direction": str(direction_filter).strip()})
-    if education_filter and str(education_filter).strip():
-        conditions.append({"education_level": str(education_filter).strip()})
-
-    if not conditions:
-        return None
-    if len(conditions) == 1:
-        return conditions[0]
-    return {"$and": conditions}
-
-
-def _describe_filter(direction: Optional[str], education: Optional[str]) -> str:
-    """生成人类可读的 where 过滤级别描述（不含城市），无条件时返回「无过滤」。"""
-    parts = []
-    if direction and str(direction).strip():
-        parts.append(f"direction={str(direction).strip()}")
-    if education and str(education).strip():
-        parts.append(f"education={str(education).strip()}")
-    return ", ".join(parts) if parts else "无过滤"
-
-
-def _build_filter_cascade(direction_filter: Optional[str],
-                          education_filter: Optional[str]) -> list:
-    """构造 where 过滤的降级级联（从严到松，仅方向 / 学历）。
-
-    城市不在 where 内（多城市岗位无法用单值等值表达），改为检索后用
-    jd_profile.location.cities 做硬约束 post-filter（见 retrieve_jobs）。
-    方向 / 学历是表述差异大的软约束，召回为空时逐级放宽，语义检索仍保相关性。
-
-    级联顺序：方向+学历 → 去方向 → 无过滤。每级返回 (desc, where)。
-    """
-    levels = [
-        (direction_filter, education_filter),
-        (None, education_filter),  # 去方向（最易导致空召回）
-        (None, None),              # 无过滤
-    ]
-    cascade, seen = [], []
-    for direction, education in levels:
-        where = build_where_filter(None, direction, education)
-        key = json.dumps(where, ensure_ascii=False, sort_keys=True)
-        if key in seen:
-            continue
-        seen.append(key)
-        cascade.append((_describe_filter(direction, education), where))
-    return cascade
-
-
-def _filter_by_city(hits: list, city_filter) -> list:
-    """城市硬约束 post-filter：只保留工作城市（可多个）含目标城市的岗位。
-
-    基于回填后的 jd_profile.location.cities 判断（多城市岗位任一城市命中即保留）。
-    用户未指定城市时原样返回。这是硬约束——过滤后为空即「该城市无岗」，
-    由上游节点据此提前终止，绝不拿别的城市凑数。
-    """
-    from resume2job.parsing.jd_parser import normalize_city, job_cities
-
-    want = normalize_city(city_filter)
-    if not want:
-        return hits
-    return [h for h in hits if want in job_cities(h.get("jd_profile") or {})]
+# ===== 硬约束（城市 / 学历 / 岗位类型）=====
+# 不再做召回后 post-filter，改为**召回前** eligibility 预筛（jobs_store.get_eligible_jobs，按 SQLite
+# 派生列 cities_json/job_types_json/min_degree_rank/*_status 资格筛选），得 allowed_job_ids，
+# 三路 Query 共用；向量走 Chroma where job_id $in、BM25 走集合过滤。方向不作硬过滤（仅 Query3 +
+# direction_bonus）；偏好排序统一到评分层 direction_bonus，检索阶段不做 α-blend。
 
 
 # ===== distance -> similarity =====
@@ -564,9 +544,10 @@ def extract_matched_terms(query_text: str, document: str, metadata: dict,
 
 
 # ===== 单条 Query 检索 =====
-def _query_once(collection, query_text: str, where: Optional[dict], n_results: int) -> list:
+def _query_once(collection, query_text: str, n_results: int, allowed_ids=None) -> list:
     """对单个 Query 执行一次向量检索，返回标准化后的命中列表。
 
+    allowed_ids 非空时限定在 eligibility 预筛出的 job_id 集合内（Chroma where job_id $in）。
     任意异常（embedding / 查询）只打印并返回 []，不向上抛。
     """
     if not query_text or not query_text.strip():
@@ -579,15 +560,15 @@ def _query_once(collection, query_text: str, where: Optional[dict], n_results: i
         print(f"[ERROR] Embedding 失败：{e}")
         return []
 
-    # 2) 查询 ChromaDB（where=None 时不传，避免空条件报错）
+    # 2) 查询 ChromaDB（硬约束召回前预筛 → 限定 allowed_ids；未传则不加 where）
     try:
         kwargs = {
             "query_embeddings": [vector],
             "n_results": max(1, n_results),
             "include": ["documents", "metadatas", "distances"],
         }
-        if where is not None:
-            kwargs["where"] = where
+        if allowed_ids:
+            kwargs["where"] = {"job_id": {"$in": sorted(allowed_ids)}}
         res = collection.query(**kwargs)
     except Exception as e:
         print(f"[ERROR] ChromaDB 查询失败：{e}")
@@ -669,24 +650,25 @@ def _finalize_hits(hits: list, query_text: str) -> list:
     return hits
 
 
-def _bm25_query_once(corpus, query_text: str, where: Optional[dict], n_results: int) -> list:
+def _bm25_query_once(corpus, query_text: str, n_results: int, allowed_ids=None) -> list:
     """对单个 Query 执行一次 BM25 检索（回填与 matched_terms 由 _finalize_hits 统一处理）。
 
+    allowed_ids 非空时限定在 eligibility 预筛出的 job_id 集合内（语料打分时过滤）。
     任意异常只打印并返回 []，与向量通道的容错约定一致。
     """
     if not query_text or not query_text.strip():
         return []
     try:
-        return corpus.search(query_text, n_results, where)
+        return corpus.search(query_text, n_results, allowed_ids=allowed_ids)
     except Exception as e:
         print(f"[ERROR] BM25 检索失败：{e}")
         return []
 
 
 def _build_rerank_query(queries: dict) -> str:
-    """把 3 个检索 Query 的关键词去重拼成 rerank 用的单一 query 文本。"""
+    """把 2 路检索 Query 的关键词去重拼成 rerank 用的单一 query 文本。"""
     tokens, seen = [], set()
-    for key in ("query_1", "query_2", "query_3"):
+    for key in ("query_1", "query_2"):
         for tok in (queries.get(key) or "").split():
             low = tok.lower()
             if low and low not in seen:
@@ -726,14 +708,14 @@ def search_jobs(
 
     ranked_lists = []
     if mode in ("vector", "hybrid"):
-        hits = _finalize_hits(_query_once(collection, query_text, None, top_k * 2), query_text)
+        hits = _finalize_hits(_query_once(collection, query_text, top_k * 2), query_text)
         if hits:
             ranked_lists.append(hits)
     if mode in ("bm25", "hybrid"):
         try:
             corpus = get_bm25_corpus(collection)
             hits = _finalize_hits(
-                _bm25_query_once(corpus, query_text, None, top_k * 2), query_text)
+                _bm25_query_once(corpus, query_text, top_k * 2), query_text)
             if hits:
                 ranked_lists.append(hits)
         except Exception as e:
@@ -754,20 +736,26 @@ def retrieve_jobs(
     resume_profile: dict,
     top_k: int = 5,
     city_filter: Optional[str] = None,
-    direction_filter: Optional[str] = None,
-    education_filter: Optional[str] = None,
+    user_degree_rank: Optional[int] = None,
+    job_type_filter: Optional[str] = None,
     verbose: bool = False,
     mode: Optional[str] = None,
     use_rerank: Optional[bool] = None,
+    preferences: Optional[dict] = None,
 ) -> list:
-    """根据用户画像召回 Top-K 候选岗位（召回 → RRF 融合 → rerank 精排）。
+    """根据用户画像召回 Top-K 候选岗位（硬约束预筛 → 召回 → RRF 融合 → rerank 精排）。
 
-    mode：vector（纯向量）/ bm25（纯关键词）/ hybrid（双通道 RRF 融合）；
-    use_rerank：是否调用 gte-rerank 精排。二者默认读 core.config
-    （RESUME2JOB_RETRIEVAL_MODE / RESUME2JOB_USE_RERANK），评测时显式传参对比。
+    硬约束（城市 / 学历 / 岗位类型）在**召回前**做 eligibility 预筛（jobs_store.get_eligible_jobs），
+    得 allowed_job_ids；Query1/Query2/Query3 三路**共用同一批 allowed_job_ids**（向量走 Chroma
+    where job_id $in、BM25 走集合过滤），不每路重查 SQLite。无 eligible 岗位直接返回 []。
 
-    返回按最终排序降序的完整候选列表（含 document/metadata/jd_profile）；
-    无结果时返回 []。verbose 仅影响日志详细度，不改变返回结构。
+    user_degree_rank：候选人学历 rank（本1硕2博3）；None=学历不卡。city_filter=None 不限城市。
+    job_type_filter 缺省由调用方给（节点默认实习）。每条命中附 city_match_status / education_match_status
+    供报告标注（如「地点待确认」）。
+
+    mode：vector / bm25 / hybrid；use_rerank：是否 gte-rerank 精排。二者默认读 core.config。
+    preferences：方向偏好 {tag: weight}，喂 Query3（助召回不改名次，排序统一到评分层 direction_bonus）。
+    返回按检索相关性降序的完整候选列表；无结果返回 []。
     """
     if not isinstance(resume_profile, dict):
         print("[ERROR] resume_profile 必须是 dict，返回空列表。")
@@ -783,12 +771,20 @@ def retrieve_jobs(
     use_bm25 = mode in ("bm25", "hybrid")
 
     top_k = max(1, int(top_k) if isinstance(top_k, (int, float)) else 5)
-    per_query_k = top_k * 2  # 每个 Query 多召回，去重后避免不足
-    # 指定城市时扩大召回池：城市在召回后才 post-filter，需保证目标城市岗位先进候选
-    if city_filter and str(city_filter).strip():
-        per_query_k = max(per_query_k, 20)
+    per_query_k = top_k * 2  # 每路多召回，去重后避免不足（预筛已限定 eligible，无需再扩池）
 
-    # 0) 连接 ChromaDB
+    # 0) 硬约束 eligibility 预筛（召回**前**）：三路 Query 共用一批 allowed_job_ids
+    constraints = resolve_hard_constraints(city_filter, user_degree_rank, job_type_filter)
+    eligible = jobs_store.get_eligible_jobs(
+        constraints.city, constraints.user_degree_rank, constraints.job_type)
+    allowed_job_ids = set(eligible)
+    if not allowed_job_ids:
+        print(f"[INFO] 硬约束预筛无 eligible 岗位（城市={constraints.city} / "
+              f"学历rank={constraints.user_degree_rank} / 类型={constraints.job_type}），返回空。")
+        return []
+    print(f"[INFO] 硬约束预筛：{len(allowed_job_ids)} 个 eligible 岗位进入召回")
+
+    # 1) 连接 ChromaDB
     if not os.path.isdir(DEFAULT_DB_PATH):
         print(f"[ERROR] ChromaDB 目录不存在：{DEFAULT_DB_PATH}，请先运行 job_indexer.py 建库。")
         return []
@@ -808,11 +804,11 @@ def retrieve_jobs(
         print(f"[ERROR] collection '{DEFAULT_COLLECTION_NAME}' 为空，没有可检索的岗位。")
         return []
 
-    # 1) 生成 Query 并打印最终用于检索的 Query
+    # 2) 生成 Query 并打印最终用于检索的 Query
     queries = generate_queries(resume_profile, verbose=verbose)
     print(_format_queries(queries))
 
-    # 1.5) BM25 通道：从同一 collection 的 documents 构建（带缓存的）内存索引
+    # 2.5) BM25 通道：从同一 collection 的 documents 构建（带缓存的）内存索引
     bm25_corpus = None
     if use_bm25:
         try:
@@ -824,52 +820,53 @@ def retrieve_jobs(
                 print("[ERROR] bm25 模式下索引构建失败，返回空列表。")
                 return []
 
-    # 2) 过滤级联：从严到松，直到召回到结果；
-    #    每级内对（3 个 Query × 启用的通道）各取一个有序命中列表，RRF 融合去重
-    cascade = _build_filter_cascade(direction_filter, education_filter)
+    # 3) 召回：2 路 Query + Query3（方向偏好）各通道有序命中，**均限定 allowed_job_ids**，RRF 融合去重
+    ranked_lists = []
+    for qkey in ("query_1", "query_2"):
+        query_text = queries.get(qkey, "")
+        if not query_text:
+            continue
+        print(f"[INFO] 执行检索：{qkey} -> {query_text}")
+        if use_vector:
+            hits = _finalize_hits(_query_once(collection, query_text, per_query_k, allowed_job_ids), query_text)
+            print(f"[INFO]   向量通道返回：{len(hits)} 条")
+            if hits:
+                ranked_lists.append(hits)
+        if use_bm25:
+            hits = _finalize_hits(_bm25_query_once(bm25_corpus, query_text, per_query_k, allowed_job_ids), query_text)
+            print(f"[INFO]   BM25 通道返回：{len(hits)} 条")
+            if hits:
+                ranked_lists.append(hits)
 
-    merged, used_desc = [], "无过滤"
-    for level_idx, (desc, where) in enumerate(cascade):
-        if level_idx > 0:
-            print(f"[WARN] 过滤结果为空，降级重试（{desc}）。")
+    # Query3（方向偏好召回，conditional）：来源优先级 preferences > 简历 intentions；皆无则不生成。
+    # 只增强目标方向召回（多一路名次支持而上浮），**同样限定 allowed_job_ids**，剔除通用基础能力。
+    q3_terms = list((preferences or {}).keys()) or _resume_intentions(resume_profile)
+    query_3 = _strip_general_base_skills(_normalize_query_text(" ".join(q3_terms)))
+    if query_3.strip():
+        print(f"[INFO] 执行方向偏好召回（Query3）：{query_3}")
+        if use_vector:
+            h = _finalize_hits(_query_once(collection, query_3, per_query_k, allowed_job_ids), query_3)
+            if h:
+                ranked_lists.append(h)
+        if use_bm25:
+            h = _finalize_hits(_bm25_query_once(bm25_corpus, query_3, per_query_k, allowed_job_ids), query_3)
+            if h:
+                ranked_lists.append(h)
 
-        ranked_lists = []
-        for qkey in ("query_1", "query_2", "query_3"):
-            query_text = queries.get(qkey, "")
-            if not query_text:
-                continue
-            print(f"[INFO] 执行检索：{qkey} -> {query_text}")
-            if use_vector:
-                hits = _finalize_hits(_query_once(collection, query_text, where, per_query_k), query_text)
-                print(f"[INFO]   向量通道返回：{len(hits)} 条")
-                if hits:
-                    ranked_lists.append(hits)
-            if use_bm25:
-                hits = _finalize_hits(_bm25_query_once(bm25_corpus, query_text, where, per_query_k), query_text)
-                print(f"[INFO]   BM25 通道返回：{len(hits)} 条")
-                if hits:
-                    ranked_lists.append(hits)
-
-        merged = rrf_fuse(ranked_lists)
-        if merged:
-            used_desc = desc
-            print(f"[INFO] RRF 融合去重后：{len(merged)} 条（过滤级别：{desc}，模式：{mode}）")
-            break
-
+    merged = rrf_fuse(ranked_lists)
     if not merged:
-        print("[INFO] 所有 Query 与过滤级别均无召回结果，返回空列表。")
+        print("[INFO] 所有 Query 均无召回结果，返回空列表。")
         return []
+    print(f"[INFO] RRF 融合去重后：{len(merged)} 条（模式：{mode}，硬约束已在召回前预筛）")
 
-    # 2.5) 城市硬约束 post-filter（基于回填的 cities，支持多城市岗位）
-    if city_filter and str(city_filter).strip():
-        before = len(merged)
-        merged = _filter_by_city(merged, city_filter)
-        print(f"[INFO] 城市过滤「{city_filter}」：{before} → {len(merged)} 条")
-        if not merged:
-            print(f"[INFO] 知识库暂无「{city_filter}」的岗位，返回空列表（硬约束）。")
-            return []
+    # 3.5) 把资格状态附到命中（city_match_status / education_match_status，供报告标「地点待确认」等）
+    for h in merged:
+        st = eligible.get(h.get("job_id"))
+        if st:
+            h["city_match_status"] = st.get("city_match_status")
+            h["education_match_status"] = st.get("education_match_status")
 
-    # 3) rerank 精排（可选）：取融合后的头部候选送交叉编码器重排
+    # 4) rerank 精排（可选）：取融合后的头部候选送交叉编码器重排
     candidates = merged[: max(top_k * 2, top_k)]
     if use_rerank:
         rerank_query = _build_rerank_query(queries)
@@ -877,9 +874,11 @@ def retrieve_jobs(
         if candidates and "rerank_score" in candidates[0]:
             print(f"[INFO] rerank 精排完成：{len(candidates)} 条候选已按相关性重排")
 
+    # 排序偏好统一到评分层 direction_bonus，检索阶段不再做 α-blend 加权重排。
+
     # 4) 截断 Top-K
     result = candidates[:top_k]
-    print(f"[INFO] 最终返回 Top-{top_k}：{len(result)} 条（过滤级别：{used_desc}）")
+    print(f"[INFO] 最终返回 Top-{top_k}：{len(result)} 条")
     return result
 
 
@@ -913,9 +912,10 @@ def main():
     parser = argparse.ArgumentParser(description="Job Retriever — 根据用户画像召回 Top-K 候选岗位")
     parser.add_argument("resume_json", help="Resume Profile JSON 文件路径")
     parser.add_argument("--top_k", type=int, default=5, help="最终返回候选岗位数量（默认 5）")
-    parser.add_argument("--city", default=None, help="城市过滤，例如 北京")
-    parser.add_argument("--direction", default=None, help="岗位方向过滤，例如 大模型算法")
-    parser.add_argument("--education", default=None, help="学历过滤，例如 本科 / 硕士")
+    parser.add_argument("--city", default=None, help="城市硬约束，例如 北京")
+    parser.add_argument("--education", default=None,
+                        help="候选人学历（本科/硕士/博士）；资格预筛保留要求≤该学历的岗位。缺省取简历 highest_degree")
+    parser.add_argument("--job_type", default=None, help="岗位类型硬约束，例如 实习 / 校招 / 社招")
     parser.add_argument("--mode", default=None, choices=["vector", "bm25", "hybrid"],
                         help="检索模式（默认读 RESUME2JOB_RETRIEVAL_MODE，缺省 hybrid）")
     parser.add_argument("--no-rerank", action="store_true", help="关闭 rerank 精排")
@@ -941,12 +941,13 @@ def main():
         print("[ERROR] resume_profile 顶层必须是 JSON 对象")
         sys.exit(1)
 
+    edu_str = str(args.education or resume_profile.get("highest_degree") or "").strip()
     results = retrieve_jobs(
         resume_profile,
         top_k=args.top_k,
         city_filter=args.city,
-        direction_filter=args.direction,
-        education_filter=args.education,
+        user_degree_rank=DEGREE_RANK.get(edu_str),
+        job_type_filter=args.job_type,
         verbose=args.verbose,
         mode=args.mode,
         use_rerank=False if args.no_rerank else None,

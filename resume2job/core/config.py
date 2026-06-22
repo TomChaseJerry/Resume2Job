@@ -43,7 +43,7 @@ DASHSCOPE_NATIVE_URL = _env(
 CHAT_MODEL = _env("RESUME2JOB_CHAT_MODEL", "deepseek-v4-pro")
 
 # ===== 轻量模型 =====
-# 规划（task_type + 检索过滤 + 通勤意图的 Function Calling 结构化输出）：输出短、规则明确。
+# 规划（intent + job_source + assist_actions + 硬约束 + 通勤的 Function Calling 结构化输出）：输出短、规则明确。
 PLANNER_MODEL = _env("RESUME2JOB_PLANNER_MODEL", "qwen-flash")
 # 评分（project/direction）：rubric 明确、输出仅 score + evidence。
 SCORE_MODEL = _env("RESUME2JOB_SCORE_MODEL", "qwen-plus")
@@ -64,3 +64,16 @@ RETRIEVAL_MODE = _env("RESUME2JOB_RETRIEVAL_MODE", "hybrid")
 USE_RERANK = _env_bool("RESUME2JOB_USE_RERANK", True)
 # RRF 融合常数（业界常用 60）：score = Σ 1 / (RRF_K + rank)
 RRF_K = int(_env("RESUME2JOB_RRF_K", "60"))
+
+# ===== 会话短期状态（session_state）=====
+# Redis 为主、SQLite/内存回退（见 storage/session_store.py）；无 Redis 时自动降级。
+REDIS_URL = _env("RESUME2JOB_REDIS_URL", "redis://localhost:6379/0")
+SESSION_TTL = int(_env("RESUME2JOB_SESSION_TTL", "86400"))  # 会话短期状态过期秒数（默认 1 天）
+
+# ===== Planner =====
+# 规划置信度下限：LLM 输出 confidence 低于此值时进入澄清而非默认跑推荐链路。
+PLANNER_CONFIDENCE_MIN = float(_env("RESUME2JOB_PLANNER_CONFIDENCE_MIN", "0.55"))
+
+# ===== 软偏好（soft_preferences 闭环）=====
+# 软偏好在精排阶段的加权系数：final = (1-α)·base + α·pref_score（α 小，偏好是加分项非决定项）。
+PREF_WEIGHT_ALPHA = float(_env("RESUME2JOB_PREF_WEIGHT_ALPHA", "0.15"))

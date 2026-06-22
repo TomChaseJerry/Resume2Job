@@ -2,16 +2,22 @@
 岗位匹配评分模块（Match Scorer）
 
 输入：Resume Profile JSON + JD Profile JSON
-输出：多维度评分 + 风险分析 + 总分 + 推荐等级 + 摘要
+输出：两层评分（基础适配分 + 排序分）+ 风险分析 + 推荐等级 + 摘要
+
+两层评分（见 job_matching_and_ranking.md）：
+    match_score = skill_score×0.55 + project_score×0.45            # 基础适配分
+    rank_score  = min(100, match_score + direction_bonus + commute_bonus)   # 排序分
+其中 direction_bonus ≤ 6、commute_bonus ≤ 4；城市 / 学历 / 岗位类型属硬约束（召回前过滤），
+不参与评分。
 
 流程：
-    1. Python 规则计算 skill_score
-    2. Python 规则计算 education_score
-    3. LLM 计算 project_score（rubric 打分）
-    4. LLM 计算 direction_score（rubric 打分）
-    5. Python 规则生成 risk_analysis（合并 JD 已有 risk_points）
-    6. Python 加权计算 final_score
-    7. Python 判断 match_level
+    1. Python 规则计算 skill_score（分层证据 + 可替代必备）
+    2. LLM 计算 project_score（5 档 rubric 打分）
+    3. Python 加权得到 match_score
+    4. Python 规则计算 direction_bonus（方向标签映射，确定性）
+    5. Python 规则计算 commute_bonus（通勤时长分级；评分阶段通常为 0，增强阶段回填）
+    6. Python 计算 rank_score 与推荐等级 match_level
+    7. Python 规则生成 risk_analysis（含学历门槛，合并 JD 已有 risk_points）
     8. 生成简洁 summary
 """
 
@@ -20,133 +26,40 @@ import re
 import sys
 import json
 import argparse
-import concurrent.futures
 from typing import Optional, Any
 
 # 复用 JD Parser 的技能原子化逻辑，保证必备技能在匹配前也被拆分为原子技能
-from resume2job.parsing.jd_parser import split_compound_skill
+from resume2job.parsing.jd_parser import split_compound_skill, DEGREE_RANK
 
 # ===== 模型 / LLM 工具（统一走 core 层）=====
 # 模型统一从 config 读取（含 RESUME2JOB_SCORE_MODEL 等环境变量覆盖逻辑）。
 from resume2job.core.config import SCORE_MODEL as SCORE_MODEL_NAME, BASE_URL
 from resume2job.core.llm import get_api_key, safe_json_parse
+# 方向标签词表（粗粒度方向层，仅供 direction_bonus；单独成文件便于扩词，见 direction_tags.py）
+from resume2job.scoring.direction_tags import DIRECTION_TAG_VOCAB, DIRECTION_PARENTS
+# 技能分类法词表（同义词/蕴含/弱匹配簇/大类/缺口类别）——细粒度技能匹配层，见 skill_taxonomy.py
+from resume2job.scoring.skill_taxonomy import (
+    SYNONYM_MAP, SKILL_IMPLICATIONS, WEAK_SKILL_CLUSTERS,
+    SKILL_CATEGORY_KEYWORDS, SKILL_GAP_CATEGORIES,
+)
 
 
-# ===== 评分权重 =====
+# ===== 基础适配分权重（仅技能 + 项目两维）=====
 DEFAULT_WEIGHTS = {
-    "skill": 0.40,
-    "project": 0.35,
-    "education": 0.10,
-    "direction": 0.15,
+    "skill": 0.55,
+    "project": 0.45,
 }
 
-
-# ===== 学历等级 =====
-DEGREE_RANK = {"本科": 1, "硕士": 2, "博士": 3}
-
-
-# ===== 同义词表（双向同义：组内任一别名归一到首个 canonical form）=====
-SYNONYM_GROUPS = [
-    ["大模型", "大语言模型", "llm", "large language model"],
-    ["rag", "检索增强生成", "向量检索"],
-    ["agent", "智能体", "tool calling", "tool use"],
-    ["pytorch", "torch"],
-    ["tensorflow", "tf"],
-    ["强化学习", "rl", "reinforcement learning"],
-    ["模仿学习", "imitation learning"],
-    ["元学习", "meta learning", "meta-learning"],
-    ["分布式训练", "distributed training"],
-    ["分布式强化学习", "distributed rl"],
-    ["计算机视觉", "cv", "computer vision"],
-    ["自然语言处理", "nlp", "natural language processing"],
-    ["sft", "supervised fine-tuning", "有监督微调"],
-    ["rlhf", "人类反馈强化学习"],
-    ["langchain", "lang chain"],
-    ["faiss", "向量数据库"],
-    ["python", "py"],
-    ["transformer", "transformers"],
-    ["bert"],
-    ["qwen", "千问", "通义千问"],
-    ["llama", "llama2", "llama3"],
-    ["sql", "mysql", "postgresql"],
-    ["深度学习", "deep learning", "dl"],
-    ["机器学习", "machine learning", "ml"],
-    ["多模态", "multimodal", "multi-modal"],
-    ["多模态算法", "多模态融合"],
-    ["图神经网络", "gnn", "graph neural network"],
-    ["推荐系统", "recommendation system", "recsys"],
-    ["参数高效微调", "peft", "parameter efficient fine-tuning"],
-    ["lora"],
-    ["adapter"],
-    ["lstm"],
-    ["gru"],
-    ["cnn"],
-    ["rnn"],
-    ["gat", "gatv2"],
-    ["gcn"],
-    ["moe", "mixture of experts", "transformer-moe"],
-    ["算法工程化", "算法工程化经验", "工程化能力"],
-    ["表征对齐", "representation alignment"],
-]
+# ===== 偏好加分上限（rank_score = match_score + direction_bonus + commute_bonus）=====
+DIRECTION_BONUS_CAP = 6.0   # 岗位方向偏好加分上限
+COMMUTE_BONUS_CAP = 4.0     # 通勤偏好加分上限
 
 
-def _build_synonym_map() -> dict:
-    """构建 alias -> canonical 的小写映射。"""
-    mapping = {}
-    for group in SYNONYM_GROUPS:
-        canonical = group[0].strip().lower()
-        for alias in group:
-            mapping[alias.strip().lower()] = canonical
-    return mapping
+# 学历等级 DEGREE_RANK（仅用于风险分析的学历门槛判定，不参与评分）从 jd_parser 单一事实源导入（见顶部 import）。
 
 
-SYNONYM_MAP = _build_synonym_map()
-
-
-# ===== 技能蕴含表（单向：拥有 key 技能 ⇒ 隐含具备 value 列表中的能力）=====
-# 用于把项目里出现的具体技术 / 模型扩展为更上层的能力标签
-SKILL_IMPLICATIONS_RAW = {
-    "lstm": ["深度学习"],
-    "gru": ["深度学习"],
-    "rnn": ["深度学习"],
-    "cnn": ["深度学习", "计算机视觉"],
-    "transformer": ["深度学习"],
-    "transformer-moe": ["深度学习", "多模态算法", "moe"],
-    "moe": ["深度学习"],
-    "bert": ["深度学习", "自然语言处理", "transformer"],
-    "gat": ["图神经网络", "深度学习"],
-    "gatv2": ["图神经网络", "深度学习"],
-    "gcn": ["图神经网络", "深度学习"],
-    "gnn": ["深度学习"],
-    "多模态融合": ["多模态算法", "多模态"],
-    "多模态算法": ["多模态"],
-    "lora": ["大模型", "参数高效微调"],
-    "adapter": ["表征对齐", "多模态融合", "参数高效微调"],
-    "qlora": ["大模型", "参数高效微调"],
-    "pytorch": ["深度学习", "算法工程化"],
-    "tensorflow": ["深度学习", "算法工程化"],
-    "rlhf": ["强化学习", "大模型"],
-    "sft": ["大模型"],
-    "rag": ["大模型"],
-    "langchain": ["大模型", "agent"],
-    "agent": ["大模型"],
-}
-
-
-def _build_skill_implications() -> dict:
-    """归一化蕴含表的 key 与 value（统一走 SYNONYM_MAP 的 canonical form）。"""
-    norm: dict = {}
-    for k, vs in SKILL_IMPLICATIONS_RAW.items():
-        key = SYNONYM_MAP.get(k.lower(), k.lower())
-        for v in vs:
-            val = SYNONYM_MAP.get(v.lower(), v.lower())
-            norm.setdefault(key, [])
-            if val not in norm[key]:
-                norm[key].append(val)
-    return norm
-
-
-SKILL_IMPLICATIONS = _build_skill_implications()
+# 同义词表 SYNONYM_GROUPS/SYNONYM_MAP 与技能蕴含表 SKILL_IMPLICATIONS_RAW/SKILL_IMPLICATIONS
+# 已移至 scoring/skill_taxonomy.py（见顶部 import）。
 
 
 # ===== 自由文本扫描：用于从 project.tasks / project.description 中识别技能 =====
@@ -214,43 +127,48 @@ def _dedup_keep_order(items: list) -> list:
     return result
 
 
-def _collect_resume_skills(resume_profile: dict) -> dict:
-    """从 resume 多个字段综合收集候选人技能，返回 {normalized: original} 字典。
+def _collect_resume_skills(resume_profile: dict) -> tuple:
+    """从 resume 多个字段综合收集候选人技能，返回 (skill_map, demonstrated_norms)。
 
+    skill_map         ：{normalized: original} 全部技能（仅声明 ∪ 已佐证）。
+    demonstrated_norms：在**项目 / 实习 / 工作经历**里实际出现的技能归一名集合（强证据）。
+
+    证据强弱分层（job_matching_and_ranking.md §3 / 用户 2026-06-21 要求）：
+      - **已佐证**（项目 tech_stack/keywords/tasks/description、经历 keywords/tasks）→ 直接证据 1.0；
+      - **仅声明**（只在技能栏 skills / skill_groups 出现、经历里查无）→ 弱证据 0.7（status=weak）。
     采集来源：
-      1) skills（顶层扁平）
-      2) skill_groups[].items（兼容 list / dict 两种形态）
-      3) projects[].tech_stack
-      4) projects[].keywords
-      5) projects[].tasks（自由文本，扫描已知技能词）
-      6) projects[].description（自由文本）
-      7) experiences[].keywords / responsibilities（兜底）
-    然后通过 SKILL_IMPLICATIONS 做能力蕴含扩展（如 LSTM ⇒ 深度学习）。
+      1) skills（顶层扁平，**仅声明**）
+      2) skill_groups[].items（兼容 list / dict，**仅声明**）
+      3) projects[].tech_stack / keywords（**已佐证**）
+      4) projects[].tasks / achievements / description（自由文本扫描，**已佐证**）
+      5) experiences[].keywords / tasks（**已佐证**）
+    能力蕴含（LSTM⇒深度学习）不在此处展开，见 _collect_implied_skills。
     """
-    raw_pool: list = []
-    text_blobs: list = []
+    declared_pool: list = []      # 仅声明：技能栏 + skill_groups
+    demonstrated_pool: list = []  # 已佐证：项目 / 经历的结构化技能字段
+    text_blobs: list = []         # 已佐证：项目 / 经历自由文本
 
-    # 1) 顶层 skills
-    raw_pool.extend(resume_profile.get("skills") or [])
+    # 1) 顶层 skills（仅声明）
+    declared_pool.extend(resume_profile.get("skills") or [])
 
-    # 2) skill_groups
+    # 2) skill_groups（仅声明）
     sg = resume_profile.get("skill_groups")
     if isinstance(sg, list):
         for group in sg:
             if isinstance(group, dict):
-                raw_pool.extend(group.get("items") or [])
+                declared_pool.extend(group.get("items") or [])
     elif isinstance(sg, dict):
         for items in sg.values():
             if isinstance(items, list):
-                raw_pool.extend(items)
+                declared_pool.extend(items)
 
-    # 3) & 4) & 5) & 6) projects
+    # 3) & 4) projects（已佐证）
     for proj in resume_profile.get("projects") or []:
         if not isinstance(proj, dict):
             continue
-        raw_pool.extend(proj.get("tech_stack") or [])
-        raw_pool.extend(proj.get("keywords") or [])
-        # 自由文本：tasks 列表 + description 字符串
+        demonstrated_pool.extend(proj.get("tech_stack") or [])
+        demonstrated_pool.extend(proj.get("keywords") or [])
+        # 自由文本：tasks / achievements 列表 + description 字符串
         for t in proj.get("tasks") or []:
             if isinstance(t, str):
                 text_blobs.append(t)
@@ -260,32 +178,41 @@ def _collect_resume_skills(resume_profile: dict) -> dict:
         if isinstance(proj.get("description"), str):
             text_blobs.append(proj["description"])
 
-    # 7) experiences
+    # 5) experiences（已佐证）
     for exp in resume_profile.get("experiences") or []:
         if not isinstance(exp, dict):
             continue
-        raw_pool.extend(exp.get("keywords") or [])
+        demonstrated_pool.extend(exp.get("keywords") or [])
         for t in exp.get("tasks") or []:
             if isinstance(t, str):
                 text_blobs.append(t)
 
-    # 先把显式 pool 做 canonical 归一
     mapping: dict = {}
-    for raw in raw_pool:
-        norm = _normalize_skill(raw)
-        if norm and norm not in mapping:
-            mapping[norm] = raw.strip() if isinstance(raw, str) else norm
+    demonstrated: set = set()
 
-    # 自由文本扫描 → 把识别到的 canonical 技能补入 mapping
+    # 已佐证先入：结构化字段 + 自由文本扫描，记入 demonstrated 集合（强证据 1.0）
+    for raw in demonstrated_pool:
+        norm = _normalize_skill(raw)
+        if norm:
+            if norm not in mapping:
+                mapping[norm] = raw.strip() if isinstance(raw, str) else norm
+            demonstrated.add(norm)
     for blob in text_blobs:
         for canonical in _scan_text_for_skills(blob):
             if canonical not in mapping:
                 mapping[canonical] = canonical  # 原文不可逐字回显，用 canonical 代替
+            demonstrated.add(canonical)
+
+    # 仅声明后补：只在技能栏出现、经历查无的技能不计入 demonstrated（弱证据 0.7）
+    for raw in declared_pool:
+        norm = _normalize_skill(raw)
+        if norm and norm not in mapping:
+            mapping[norm] = raw.strip() if isinstance(raw, str) else norm
 
     # 注意：能力蕴含（LSTM⇒深度学习 等）不在此处展开。蕴含属于「推导证据」，
     # 强于课程、弱于直接命中，应单独按 implied 权重计分，故由 _collect_implied_skills 单列，
     # 不再混入精确命中池（避免推导能力被当成 1.0 实战命中而虚高）。
-    return mapping
+    return mapping, demonstrated
 
 
 def _collect_implied_skills(direct_map: dict) -> dict:
@@ -333,14 +260,97 @@ def _atomize(items: list) -> list:
     return _dedup_keep_order(out)
 
 
-def _collect_jd_required_skills(jd_profile: dict) -> list:
-    """JD 的**必备**技能 = hard_skills + tools_or_frameworks（原子化后）。
-    domain_keywords 不参与必备命中（避免方向词被误判为缺口），由 _collect_jd_reference_skills 单独处理。
+# ===== 可替代必备需求（「Python / C++ 其一」命中任一即满足）=====
+# 仅当原始技能条目带这些显式「任选其一」语义时，才把其原子拆分视为可替代组；
+# 「及 / 和 / 与」等并列连词不在此列（那是「都要」，仍各自独立必备）。
+_ALT_REQUIREMENT_SIGNALS = ("其一", "任一", "二选一", "二选其一", "任选", "之一", "其中之一", "任意一")
+
+
+# ===== 通用基础能力（不主导技能分）=====
+# Python/PyTorch/Linux/Git/C++/SQL/Docker 等语言/框架/开发环境区分度低、许多岗位仅要求若干项，
+# 不应作为「核心方向必备」主导技能分（scenario_overview §3 / job_matching_and_ranking.md §3.1）。
+# 它们单列做「基础能力校验」：命中小幅加分、未命中小幅扣分并提示，但不淹没核心方向匹配。
+_GENERAL_BASE_SKILLS = {
+    _normalize_skill(s) for s in
+    ["python", "pytorch", "tensorflow", "linux", "git", "c++", "c", "c/c++",
+     "sql", "docker", "numpy", "pandas", "shell", "bash", "java"]
+    if _normalize_skill(s)
+}
+
+
+def _is_base_skill(skill: str) -> bool:
+    """该技能是否属于通用基础能力。"""
+    n = _normalize_skill(skill)
+    return bool(n) and n in _GENERAL_BASE_SKILLS
+
+
+def _collect_required_units(jd_profile: dict) -> tuple:
+    """收集必备「需求单元」，并区分核心方向技能与通用基础能力。
+
+    返回 (core_units, base_units)，每个 unit 是一组原子技能（list）：
+      - 单元素 [skill]       ：普通必备（命中该技能才满足）；
+      - 多元素 [s1, s2, ...]  ：可替代组（命中任一即满足，其余不算缺口）。
+    core_units = 核心方向 / 工程技能（主导技能分）；base_units = 通用基础能力（不主导，仅小幅加减）。
+
+    可替代组来源：jd_profile.required_alternatives（解析层产出）+ 原始 hard_skill 条目「其一」兜底。
+    domain_keywords 不计入必备（由 _collect_jd_reference_skills 处理）。
     """
-    pool = []
-    pool.extend(jd_profile.get("hard_skills") or [])
-    pool.extend(jd_profile.get("tools_or_frameworks") or [])
-    return _atomize(pool)
+    alt_groups: list = []
+    grouped_norm: set = set()
+
+    def _add_group(atoms: list) -> None:
+        atoms = _dedup_keep_order(atoms)
+        if len(atoms) < 2:
+            return
+        key = frozenset(_normalize_skill(a) or a.strip().lower() for a in atoms)
+        if any(frozenset(_normalize_skill(x) or x.strip().lower() for x in g) == key for g in alt_groups):
+            return
+        alt_groups.append(atoms)
+        for a in atoms:
+            n = _normalize_skill(a)
+            if n:
+                grouped_norm.add(n)
+
+    # 1) 解析层给出的可替代组（首选）
+    for grp in jd_profile.get("required_alternatives") or []:
+        _add_group(_atomize(grp) if isinstance(grp, list) else _atomize([grp]))
+
+    pool = list(jd_profile.get("hard_skills") or []) + list(jd_profile.get("tools_or_frameworks") or [])
+
+    # 2) 兜底：原始条目仍含「其一」时识别为组（解析层未填字段、或被直接调用时）
+    for raw in pool:
+        if isinstance(raw, str) and any(sig in raw for sig in _ALT_REQUIREMENT_SIGNALS):
+            cleaned = raw
+            for sig in sorted(_ALT_REQUIREMENT_SIGNALS, key=len, reverse=True):
+                cleaned = cleaned.replace(sig, " ")
+            cleaned = cleaned.replace("或", "/")
+            atoms = split_compound_skill(cleaned)
+            if len(atoms) >= 2:
+                _add_group(atoms)
+
+    # 3) 单项必备（排除已在可替代组里的原子）
+    singles: list = []
+    seen: set = set(grouped_norm)
+    for raw in pool:
+        if not isinstance(raw, str):
+            continue
+        # 含「其一」信号的条目其原子已由步骤 1/2 的可替代组覆盖，跳过以免「C++ 其一」等残片漏成单项
+        if any(sig in raw for sig in _ALT_REQUIREMENT_SIGNALS):
+            continue
+        for atom in split_compound_skill(raw):
+            n = _normalize_skill(atom)
+            if n and n not in seen:
+                seen.add(n)
+                singles.append([atom])
+
+    # 4) 分类：整组都是基础能力 -> base；否则 -> core
+    core_units, base_units = [], []
+    for unit in alt_groups + singles:
+        if all(_is_base_skill(a) for a in unit):
+            base_units.append(unit)
+        else:
+            core_units.append(unit)
+    return core_units, base_units
 
 
 def _collect_jd_reference_skills(jd_profile: dict) -> list:
@@ -348,16 +358,7 @@ def _collect_jd_reference_skills(jd_profile: dict) -> list:
     return _atomize(jd_profile.get("domain_keywords") or [])
 
 
-# ===== 弱匹配（weak match）：可迁移基础但非精确命中 =====
-# 同一簇内的技能视为弱相关：某必备技能未精确命中，但候选人具备同簇能力时记为弱匹配。
-WEAK_SKILL_CLUSTERS = [
-    {"多传感器信息处理", "多传感器信息融合", "多源传感器建模", "多传感器融合",
-     "多模态融合", "多模态", "传感器融合", "多源信息融合", "传感器建模"},
-    {"深度学习", "神经网络", "deep learning"},
-    {"运动控制", "运动规划", "轨迹规划", "轨迹生成", "机器人规划控制", "机器人运动学", "动力学建模"},
-    {"强化学习", "模仿学习", "rl", "ppo", "sac"},
-    {"动力学建模", "运动学建模", "建模", "时序建模", "时空建模"},
-]
+# 弱匹配「同簇」表 WEAK_SKILL_CLUSTERS 已移至 scoring/skill_taxonomy.py（见顶部 import）。
 
 
 def _chinese_fragments(text: str, n: int = 3) -> set:
@@ -373,19 +374,7 @@ def _chinese_fragments(text: str, n: int = 3) -> set:
     return frags
 
 
-# ===== 技能大类（用于约束「共享片段」弱匹配，避免只沾「算法 / 学习」等泛词就误判）=====
-# 一个技能可命中多个大类；两个技能仅当**共享至少一个大类**时，才允许走「共享中文片段」弱匹配。
-_SKILL_CATEGORY_KEYWORDS = {
-    "感知融合": ["传感器", "感知", "多模态", "融合", "点云"],
-    "视觉": ["视觉", "图像", "视频", "ocr", "检测", "分割"],
-    "规划控制": ["规划", "控制", "轨迹", "导航", "运动", "定位", "slam", "飞控", "姿态", "动力学"],
-    "学习算法": ["强化学习", "模仿学习", "元学习", "深度学习", "机器学习", "神经网络"],
-    "检索搜索": ["搜索", "检索", "召回", "排序", "rag", "向量"],
-    "推荐广告": ["推荐", "搜广推", "广告", "recsys"],
-    "大模型": ["大模型", "llm", "agent", "智能体", "微调", "预训练", "对齐"],
-    "运筹优化": ["运筹", "优化", "调度", "排程", "求解"],
-    "自然语言": ["自然语言", "nlp", "文本", "语义", "对话"],
-}
+# 技能大类护栏 SKILL_CATEGORY_KEYWORDS 已移至 scoring/skill_taxonomy.py（见顶部 import）。
 
 
 def _skill_categories(skill: str) -> set:
@@ -393,7 +382,7 @@ def _skill_categories(skill: str) -> set:
     if not isinstance(skill, str) or not skill.strip():
         return set()
     low = skill.lower()
-    return {cat for cat, kws in _SKILL_CATEGORY_KEYWORDS.items()
+    return {cat for cat, kws in SKILL_CATEGORY_KEYWORDS.items()
             if any(kw in low for kw in kws)}
 
 
@@ -430,12 +419,23 @@ def _is_weak_match(required_norm: str, required_raw: str,
 
 
 # ===== 技能证据来源权重（越直接越高；蕴含/课程/弱匹配为弱证据，避免虚高）=====
-_W_DIRECT = 1.0        # 技能栏 / 项目技术栈 / 关键词 / 项目文本直接出现
+_W_DIRECT = 1.0        # 已佐证：项目 / 实习 / 工作经历里实际出现（技术栈 / 关键词 / 经历文本）
+_W_DECLARED = 0.7      # 仅声明：只在技能栏 / skill_groups 出现、经历里查无佐证（status=weak）
 _W_IMPLIED = 0.7       # 能力蕴含：由具体技术推导出的上位能力（如 LSTM⇒深度学习）
 _W_COURSE = 0.5        # 课程级证据（学过但无项目实践）
 _W_COURSE_CORE = 0.35  # 课程级证据，且该技能恰为岗位核心方向时进一步降权
 _W_WEAK = 0.5          # 弱簇 / 同大类共享片段
-_BONUS_CAP = 20.0      # preferred + domain 加分上限，防止加分项淹没核心缺口
+_BONUS_CAP = 10.0      # preferred + domain 加分上限（再按核心覆盖率缩放），防止加分项淹没核心缺口
+
+# 证据档 → skill_gap 三态（status 的唯一权威：规则层决定，LLM 只叙述不决定）
+# declared（仅声明未佐证）与 implied/weak 同归 weak：候选人列了该技能但无项目实证。
+_BUCKET_TO_STATUS = {"matched": "matched", "declared": "weak", "implied": "weak", "weak": "weak", "missing": "missing"}
+
+# 通用基础能力对技能分的影响（小幅、封顶，不主导核心方向匹配，见 §3.1）
+_W_BASE_HIT = 2.0      # 每命中一项 JD 必备基础能力的加分
+_BASE_HIT_CAP = 8.0    # 基础能力命中加分上限
+_W_BASE_MISS = 4.0     # 每未命中一项 JD 必备基础能力的扣分
+_BASE_MISS_CAP = 12.0  # 基础能力缺口扣分上限
 
 
 def _is_core_direction_skill(skill_norm: str, jd_profile: dict) -> bool:
@@ -451,26 +451,52 @@ def _is_core_direction_skill(skill_norm: str, jd_profile: dict) -> bool:
     return skill_norm in direction or direction in skill_norm
 
 
+def _evaluate_required_atom(raw: str, resume_norm_set: set, demonstrated_set: set,
+                            implied_skill_set: set, course_skill_set: set,
+                            resume_raw_list: list, jd_profile: dict) -> tuple:
+    """对单个必备原子技能取最高一档证据权重，返回 (weight, bucket)。
+
+    bucket ∈ {matched(已佐证 1.0) / declared(仅声明 0.7) / implied(蕴含 0.7) /
+              weak(课程/弱匹配 0.35~0.5) / missing(0)}。
+    已佐证（demonstrated_set）= 经历/项目里实际出现；仅声明 = 在技能栏出现但经历查无。
+    """
+    norm = _normalize_skill(raw)
+    if norm and norm in demonstrated_set:
+        return _W_DIRECT, "matched"
+    if norm and norm in resume_norm_set:          # 仅声明（在简历技能池但非已佐证）
+        return _W_DECLARED, "declared"
+    if norm and norm in implied_skill_set:
+        return _W_IMPLIED, "implied"
+    if norm and norm in course_skill_set:
+        w = _W_COURSE_CORE if _is_core_direction_skill(norm, jd_profile) else _W_COURSE
+        return w, "weak"
+    if _is_weak_match(norm or "", raw, resume_norm_set, resume_raw_list):
+        return _W_WEAK, "weak"
+    return 0.0, "missing"
+
+
 # ===== 1. skill_score：Python 规则计算 =====
 def calculate_skill_score(resume_profile: dict, jd_profile: dict) -> dict:
-    """技能匹配评分（原子化 + 分层证据加权 + 加分上限）。
+    """技能匹配评分（核心方向技能主导 + 通用基础能力小幅加减 + 可替代必备 + 加分上限）。
 
-    每个必备技能按证据来源取最高一档权重：
-      - 直接命中（技能栏/项目）           1.0
-      - 能力蕴含（具体技术推出上位能力）   0.7
-      - 课程级证据                         0.5（若恰为岗位核心方向则 0.35）
-      - 弱簇 / 同大类共享片段              0.5
-      - 缺口                               0
-    base = Σ(命中权重) / required 总数 × 100；
-    bonus = preferred×5 + domain×3，但封顶 _BONUS_CAP，且必备基础过弱时限制抬分，
-    避免加分项淹没核心缺口（如有 Python+深度学习但无 RL 项目，仍不应被拉成高匹配）。
+    每个必备「需求单元」按证据来源取最高一档权重（可替代组取组内任一最高）：
+      已佐证命中 1.0 / 仅声明 0.7 / 能力蕴含 0.7 / 课程级 0.5（核心方向 0.35）/ 弱匹配 0.5 / 缺口 0。
+      （已佐证=项目/实习/工作经历里实际出现；仅声明=只在技能栏出现、经历查无 → status=weak）
+
+    分层（job_matching_and_ranking.md §3.1 + scenario_overview §3）：
+      - **核心方向技能（core_units）主导技能分**：base = Σ(core 单元命中权重) / core 单元数 × 100；
+      - **通用基础能力（base_units，Python/PyTorch/Linux/Git…）不主导**：命中小幅加分（≤+8）、
+        未命中小幅扣分（≤−12）并计入缺口提示；
+      - 若 JD 只列基础能力（无 core）：基础能力才作为主信号；
+      - 「Python / C++ 其一」可替代必备：命中任一即满足、其余不计缺口（见 _collect_required_units）；
+      - preferred×5 + domain×3 加分封顶 _BONUS_CAP；核心基础过弱（base<40）时限制加分抬分。
     """
-    required_raw = _collect_jd_required_skills(jd_profile)
+    core_units, base_units = _collect_required_units(jd_profile)
     preferred_raw = _atomize(jd_profile.get("preferred_skills") or [])
     domain_raw = _collect_jd_reference_skills(jd_profile)
 
     # JD 完全没有任何技能信号时给保底分
-    if not required_raw and not preferred_raw and not domain_raw:
+    if not core_units and not base_units and not preferred_raw and not domain_raw:
         return {
             "score": 80,
             "matched_skills": [],
@@ -481,8 +507,8 @@ def calculate_skill_score(resume_profile: dict, jd_profile: dict) -> dict:
             "evidence": ["JD未提供明确硬技能要求，按默认值给 80 分。"],
         }
 
-    # 分层简历技能池：直接（1.0）/ 蕴含（0.7）/ 课程（0.5）
-    resume_skill_map = _collect_resume_skills(resume_profile)
+    # 分层简历技能池：已佐证（1.0）/ 仅声明（0.7）/ 蕴含（0.7）/ 课程（0.5）
+    resume_skill_map, demonstrated_set = _collect_resume_skills(resume_profile)
     resume_norm_set = set(resume_skill_map.keys())
     implied_skill_set = set(_collect_implied_skills(resume_skill_map).keys())
     course_skill_set = _collect_course_skills(resume_profile)
@@ -491,36 +517,77 @@ def calculate_skill_score(resume_profile: dict, jd_profile: dict) -> dict:
         v for v in resume_skill_map.values() if isinstance(v, str)
     ]
 
-    # 必备技能逐项取最高一档权重：直接 > 蕴含 > 课程 > 弱匹配 > 缺口
     matched = []          # 直接命中 1.0
     implied_matched = []  # 蕴含 0.7
     weak_matched = []     # 课程 / 弱簇 / 同大类片段 0.35~0.5
     missing = []
-    weight_sum = 0.0
-    for raw in required_raw:
-        norm = _normalize_skill(raw)
-        if norm and norm in resume_norm_set:
-            matched.append(raw)
-            weight_sum += _W_DIRECT
-        elif norm and norm in implied_skill_set:
-            implied_matched.append(raw)
-            weight_sum += _W_IMPLIED
-        elif norm and norm in course_skill_set:
-            w = _W_COURSE_CORE if _is_core_direction_skill(norm, jd_profile) else _W_COURSE
-            weak_matched.append(raw)
-            weight_sum += w
-        elif _is_weak_match(norm or "", raw, resume_norm_set, resume_raw_list):
-            weak_matched.append(raw)
-            weight_sum += _W_WEAK
-        else:
-            missing.append(raw)
+    # 逐技能状态明细（规则层权威，供 skill_gap 直接用、避免与 LLM 判定不一致）
+    skill_status: dict = {}
 
-    # 优先技能命中
+    def _mark_status(unit: list, bucket: str, importance: str) -> None:
+        """把单元（含可替代组所有原子）标成同一 status（组满足则成员都不算缺口）。"""
+        st = _BUCKET_TO_STATUS.get(bucket, "missing")
+        for a in unit:
+            n = _normalize_skill(a)
+            if n and n not in skill_status:
+                skill_status[n] = {"label": a, "importance": importance, "status": st}
+
+    def _eval_unit(unit: list) -> tuple:
+        """可替代组取组内命中证据最强的原子，返回 (best_w, best_bucket, best_atom)。"""
+        best_w, best_bucket, best_atom = 0.0, "missing", unit[0]
+        for atom in unit:
+            w, bucket = _evaluate_required_atom(
+                atom, resume_norm_set, demonstrated_set, implied_skill_set,
+                course_skill_set, resume_raw_list, jd_profile,
+            )
+            if w > best_w:
+                best_w, best_bucket, best_atom = w, bucket, atom
+        return best_w, best_bucket, best_atom
+
+    def _record(bucket: str, atom: str, label: str) -> None:
+        if bucket == "matched":
+            matched.append(atom)
+        elif bucket == "implied":
+            implied_matched.append(atom)
+        elif bucket in ("weak", "declared"):   # 仅声明并入弱匹配展示（status=weak）
+            weak_matched.append(atom)
+        else:
+            missing.append(label)
+
+    # 1) 核心方向技能：主导技能分
+    core_weight = 0.0
+    for unit in core_units:
+        w, bucket, atom = _eval_unit(unit)
+        core_weight += w
+        _record(bucket, atom, "/".join(unit) if len(unit) > 1 else unit[0])
+        _mark_status(unit, bucket, "must")
+
+    # 2) 通用基础能力：单独统计命中 / 缺口（不进 core 分母）
+    base_weight = 0.0
+    base_hit = base_miss = 0
+    for unit in base_units:
+        w, bucket, atom = _eval_unit(unit)
+        base_weight += w
+        label = "/".join(unit) if len(unit) > 1 else unit[0]
+        if w > 0:
+            base_hit += 1
+            _record(bucket, atom, label)   # 基础能力命中也计入匹配，供下游展示
+        else:
+            base_miss += 1
+            missing.append(label)          # 未命中基础必备：计入缺口提示
+        _mark_status(unit, bucket, "must")
+
+    # 优先技能：命中（直接）计入加分；并按证据档为每项记 status（供 skill_gap 展示）
     preferred_matched = []
     for raw in preferred_raw:
         norm = _normalize_skill(raw)
         if norm and norm in resume_norm_set:
             preferred_matched.append(raw)
+        w, bucket = _evaluate_required_atom(
+            raw, resume_norm_set, demonstrated_set, implied_skill_set,
+            course_skill_set, resume_raw_list, jd_profile,
+        )
+        _mark_status([raw], bucket, "preferred")
 
     # 方向 / 领域词命中（辅助参考，不计入 missing）
     domain_matched = []
@@ -529,31 +596,45 @@ def calculate_skill_score(resume_profile: dict, jd_profile: dict) -> dict:
         if norm and norm in resume_norm_set:
             domain_matched.append(raw)
 
-    # 基础分：按各档证据权重之和归一
-    if required_raw:
-        base = (weight_sum / len(required_raw)) * 100.0
+    # 基础分：核心方向技能主导；基础能力仅小幅加减、不主导
+    n_core = len(core_units)
+    n_base = len(base_units)
+    if n_core:
+        base = (core_weight / n_core) * 100.0
+        base += min(_BASE_HIT_CAP, base_hit * _W_BASE_HIT)
+        base -= min(_BASE_MISS_CAP, base_miss * _W_BASE_MISS)
+        base = max(0.0, min(100.0, base))
+    elif n_base:
+        # JD 仅列通用基础能力：此时基础能力作为主信号
+        base = (base_weight / n_base) * 100.0
     elif preferred_raw or domain_raw:
         base = 60.0
     else:
         base = 80.0
 
-    # 加分项：封顶，避免泛化优先词把分数拉过高
+    # 加分项：封顶后**按核心覆盖率缩放**——核心方向覆盖弱时加分按比例缩水，
+    # 平滑地防止「只命中泛优先词 / 领域词却被加分抬成高匹配」（替代旧的 base<40 生硬封顶）。
     bonus = min(5.0 * len(preferred_matched) + 3.0 * len(domain_matched), _BONUS_CAP)
+    # 核心覆盖率：有 core 用其命中率；无 core 但有 base（纯工具型 JD）给满；
+    # 纯 preferred/domain（既无 core 也无 base）→ 0，不让加分项把 base=60 抬高（加分不主导）。
+    core_coverage = (core_weight / n_core) if n_core else (1.0 if n_base else 0.0)
+    bonus *= core_coverage
     raw_score = base + bonus
-    # 必备基础过弱（base<40）时，加分不得把岗位抬成高匹配（核心缺口不能被加分掩盖）
-    if required_raw and base < 40.0:
-        raw_score = min(raw_score, 60.0)
     score = int(round(max(0.0, min(100.0, raw_score))))
 
     # evidence
     evidence = []
-    if required_raw:
+    if n_core:
         evidence.append(
-            f"必备技能直接命中 {len(matched)}/{len(required_raw)}："
-            f"[{', '.join(matched) if matched else '无'}]；"
-            f"蕴含命中 [{', '.join(implied_matched) if implied_matched else '无'}]（0.7 权重）；"
-            f"弱匹配（课程/可迁移）[{', '.join(weak_matched) if weak_matched else '无'}]；"
+            f"核心方向必备 {n_core} 项："
+            f"直接命中 [{', '.join(matched) if matched else '无'}]；"
+            f"蕴含 [{', '.join(implied_matched) if implied_matched else '无'}]（0.7）；"
+            f"弱匹配 [{', '.join(weak_matched) if weak_matched else '无'}]；"
             f"核心缺口 [{', '.join(missing[:8]) if missing else '无'}]。"
+        )
+    if n_base:
+        evidence.append(
+            f"通用基础能力命中 {base_hit}/{n_base}（命中加分≤{int(_BASE_HIT_CAP)}、缺口扣分≤{int(_BASE_MISS_CAP)}，不主导技能分）。"
         )
     if preferred_raw:
         evidence.append(
@@ -577,47 +658,48 @@ def calculate_skill_score(resume_profile: dict, jd_profile: dict) -> dict:
         "implied_matched_skills": implied_matched,
         "missing_skills": missing,
         "preferred_matched_skills": preferred_matched,
+        # 逐技能状态明细（规则权威）：{归一技能: {label, importance(must/preferred), status(matched/weak/missing)}}
+        # skill_gap 直接据此定 status，LLM 只补叙述，保证 skill_score 与 skill_gap 一致。
+        "skill_status": skill_status,
         "evidence": evidence,
     }
 
 
-# ===== 2. education_score：Python 规则计算 =====
+# ===== 2. education_gate：学历门槛三态（不计入评分）=====
 def calculate_education_score(resume_profile: dict, jd_profile: dict) -> dict:
-    """学历评分。"""
+    """学历门槛三态 gate（**不计入匹配分**，仅供风险提示与报告语气）。
+
+    返回 {"gate": "satisfied"|"indeterminate"|"insufficient", "evidence": [...]}：
+      - satisfied    ：JD 无学历要求 / 不限，或候选人学历 ≥ 要求；
+      - indeterminate：JD 或候选人学历无法判断（按规范不硬过滤，报告标「待确认」）；
+      - insufficient ：候选人学历明确低于 JD 要求。
+    学历本是召回前的硬约束（jobs_store.get_eligible_jobs 资格预筛），此函数只为穿过过滤的
+    岗位（无要求 / 不可判定）在报告里标注门槛状态，不参与评分（原 0~100 score 是旧加权模型遗留）。
+    """
     jd_level = jd_profile.get("education_level")
     resume_degree = resume_profile.get("highest_degree")
 
-    # 1) JD 无学历要求或不限
+    # 1) JD 无学历要求或不限 → 无门槛
     if jd_level is None or jd_level == "不限":
-        return {
-            "score": 90,
-            "evidence": [f"JD 学历要求：{jd_level or '未提及'}，按默认值给 90 分。"],
-        }
+        return {"gate": "satisfied",
+                "evidence": [f"JD 学历要求：{jd_level or '未提及'}，无学历门槛。"]}
 
     jd_rank = DEGREE_RANK.get(jd_level)
     resume_rank = DEGREE_RANK.get(resume_degree) if resume_degree else None
 
-    # 2) 无法判断任一方
+    # 2) 任一方无法判断 → 待确认（不硬过滤）
     if jd_rank is None or resume_rank is None:
-        return {
-            "score": 60,
-            "evidence": [
-                f"无法判断学历匹配关系：JD 要求 '{jd_level}'，候选人最高学历 '{resume_degree}'。"
-            ],
-        }
+        return {"gate": "indeterminate",
+                "evidence": [f"无法判断学历匹配关系：JD 要求 '{jd_level}'，候选人最高学历 '{resume_degree}'，报告标待确认。"]}
 
-    # 3) 候选人学历 >= JD 要求
+    # 3) 候选人学历 >= JD 要求 → 满足
     if resume_rank >= jd_rank:
-        return {
-            "score": 100,
-            "evidence": [f"候选人学历 '{resume_degree}' 满足 JD 要求 '{jd_level}'。"],
-        }
+        return {"gate": "satisfied",
+                "evidence": [f"候选人学历 '{resume_degree}' 满足 JD 要求 '{jd_level}'。"]}
 
-    # 4) 候选人学历不足
-    return {
-        "score": 0,
-        "evidence": [f"候选人学历 '{resume_degree}' 低于 JD 要求 '{jd_level}'。"],
-    }
+    # 4) 候选人学历不足 → 门槛不满足
+    return {"gate": "insufficient",
+            "evidence": [f"候选人学历 '{resume_degree}' 低于 JD 要求 '{jd_level}'。"]}
 
 
 # ===== 3 & 4. LLM 评分 =====
@@ -633,35 +715,25 @@ SYSTEM_PROMPT_SCORE = """你是一位资深招聘评估专家，请根据提供�
 7. 如果信息不足，请给保守分数，并在 evidence 中说明原因。"""
 
 
-PROJECT_RUBRIC = """【project_score Rubric】
-- 0分：项目经历与岗位完全无关。
-- 50分：项目经历与岗位略有相关，但缺少直接支撑。
-- 75分：项目经历与岗位方向相关，能够支撑部分岗位职责。
-- 100分：项目经历与岗位高度相关，技术栈、任务目标或业务场景高度一致。
+PROJECT_RUBRIC = """【project_score Rubric】（5 档：0 / 25 / 50 / 75 / 100）
+- 0分：无相关项目或经历证据。
+- 25分：仅有泛领域相关性（例如都属于 AI，但任务本身无关）。
+- 50分：存在部分任务、方法或技术重叠，但核心职责不同。
+- 75分：项目任务、方法或业务场景高度相关，能支撑部分岗位职责。
+- 100分：项目直接覆盖岗位的核心工作内容与关键技术。
 
 【重要约束】
-- 只能依据 resume 的 `projects` 字段评估项目相关性；
+- 只能依据 resume 的 `projects`（含科研 / 实习经历）评估项目相关性；
 - **禁止**把 `job_preferences`（求职意向）、课程、研究方向、技能标签当作项目经历；
 - evidence 描述项目时必须引用真实的项目名称与内容，禁止臆造「候选人有 NLP 项目」之类未在 projects 中出现的说法；
-- 可以指出项目体现的可迁移能力（如多模态融合、图神经网络、多源传感器建模、时序建模、RAG/Agent 系统原型），
-  但若岗位核心是机器人运动控制 / 轨迹规划 / 强化学习控制 / 仿真与真机部署，而 projects 中无直接证据，
-  则相关性应保守评估（通常 40~55 分），不可因「同属 AI」而高估。
-- 【应用层 vs 训练层·重要】当岗位核心包含「大模型训练 / 后训练 / RLHF / 预训练 / 底层算法优化 / 模型加速 /
-  垂类大模型研发」等**训练层**职责，而候选人项目偏「大模型应用 / RAG / Agent 系统开发 / 推荐召回应用」等
-  **应用层**时：即便方向高度相关，项目相关性也最高给 85~90，**不可给满分 100**——应用层项目无法完整支撑
-  训练层职责，给 100 会高估。只有当 projects 中确有训练 / 微调 / 加速等直接证据时，才可接近 100。"""
-
-
-DIRECTION_RUBRIC = """【direction_score Rubric】（请严格区分「泛 AI 相关」与「岗位核心方向一致」）
-- 20分：仅有广义 AI / 机器学习背景，但与岗位核心方向缺少直接关系（弱相关）。
-- 35分：有少量可迁移基础（如深度学习、多模态、多源传感器建模），但没有岗位核心方向的直接项目。
-- 60分：在岗位核心方向（如机器人、强化学习、控制、规划、仿真）中已有部分直接项目。
-- 100分：具备岗位核心方向的直接经验（如运动控制、轨迹规划、RL 控制、Sim2Real 或机器人真机部署）。
-
-【重要约束】
-- 对机器人 / 具身智能运动控制类岗位：若候选人没有机器人控制 / 轨迹规划 / 强化学习控制 / ROS / SLAM /
-  机器人仿真平台 / 真机部署的直接项目，**最高不超过 35 分**，不得仅因同属 AI 而给到 60；
-- 机器学习、多模态、GNN 等与具身智能仅属「弱相关」（约 20~35），不要判为「部分相关」(60)。"""
+- 泛 AI 相关 ≠ 岗位核心方向匹配；应用层项目 ≠ 训练层项目；
+- RAG、Agent 等应用项目不能直接等价于预训练、后训练、RLHF 或强化学习项目；
+- 若岗位核心是机器人控制 / 强化学习 / 轨迹规划 / SLAM / 真机部署，而 projects 中无对应证据，
+  只能给低分或中低分（通常 ≤50）；
+- 【应用层 vs 训练层】岗位核心为大模型训练 / 后训练 / RLHF / 预训练 / 模型加速等**训练层**职责，
+  而候选人项目偏「大模型应用 / RAG / Agent / 推荐召回应用」等**应用层**时：即便方向高度相关也最高给 75，
+  **不可给 100**；只有 projects 中确有训练 / 微调 / 加速等直接证据时才可接近 100；
+- 评分结果需在 evidence 中返回匹配证据、主要缺口与简短理由。"""
 
 
 def _resume_subset_for_project(resume_profile: dict) -> dict:
@@ -670,32 +742,6 @@ def _resume_subset_for_project(resume_profile: dict) -> dict:
         "projects": resume_profile.get("projects") or [],
         "experiences": resume_profile.get("experiences") or [],
         "skills": resume_profile.get("skills") or [],
-    }
-
-
-def _resume_subset_for_direction(resume_profile: dict) -> dict:
-    """裁剪给 direction_score 用的 resume 字段。"""
-    return {
-        "job_preferences": resume_profile.get("job_preferences") or {},
-        "skills": resume_profile.get("skills") or [],
-        "projects": [
-            {
-                "name": p.get("name"),
-                "description": p.get("description"),
-                "keywords": p.get("keywords") or [],
-            }
-            for p in (resume_profile.get("projects") or [])
-            if isinstance(p, dict)
-        ],
-        "experiences": [
-            {
-                "company": e.get("company"),
-                "title": e.get("title"),
-                "keywords": e.get("keywords") or [],
-            }
-            for e in (resume_profile.get("experiences") or [])
-            if isinstance(e, dict)
-        ],
     }
 
 
@@ -711,32 +757,17 @@ def _jd_subset_for_project(jd_profile: dict) -> dict:
     }
 
 
-def _jd_subset_for_direction(jd_profile: dict) -> dict:
-    return {
-        "title": jd_profile.get("title"),
-        "direction": jd_profile.get("direction"),
-        "business_area": jd_profile.get("business_area"),
-        "domain_keywords": jd_profile.get("domain_keywords") or [],
-        "responsibilities": jd_profile.get("responsibilities") or [],
-    }
-
-
-def _build_user_prompt_for_score(task_type: str, resume_subset: dict, jd_subset: dict) -> str:
-    """构造打分 User Prompt。"""
-    if task_type == "project_score":
-        rubric = PROJECT_RUBRIC
-        hint = ("请仅依据 projects 字段评估项目与岗位职责 / 方向 / 业务场景的相关性；"
-                "不要把求职意向、课程或技能标签当作项目经历。")
-    else:
-        rubric = DIRECTION_RUBRIC
-        hint = ("请聚焦候选人技能方向 / 项目方向与岗位核心方向的一致性，"
-                "严格区分『泛 AI 相关』与『岗位核心方向一致』；缺少岗位核心方向直接项目时从严打分。")
+def _build_user_prompt_for_score(resume_subset: dict, jd_subset: dict) -> str:
+    """构造 project_score 打分 User Prompt。"""
+    rubric = PROJECT_RUBRIC
+    hint = ("请仅依据 projects（含科研 / 实习）字段评估项目与岗位职责 / 方向 / 业务场景的相关性；"
+            "不要把求职意向、课程或技能标签当作项目经历；缺少岗位核心方向直接项目时从严打分。")
 
     resume_str = json.dumps(resume_subset, ensure_ascii=False, indent=2)
     jd_str = json.dumps(jd_subset, ensure_ascii=False, indent=2)
 
     return (
-        f"【评分任务】{task_type}\n\n"
+        "【评分任务】project_score\n\n"
         f"{rubric}\n\n"
         f"{hint}\n\n"
         "===== 候选人相关信息 =====\n"
@@ -744,7 +775,7 @@ def _build_user_prompt_for_score(task_type: str, resume_subset: dict, jd_subset:
         "===== 岗位相关信息 =====\n"
         f"{jd_str}\n\n"
         "===== 输出 JSON Schema =====\n"
-        '{\n  "score": 0~100 的整数,\n  "evidence": ["原因1", "原因2"]\n}\n\n'
+        '{\n  "score": 0/25/50/75/100 之一,\n  "evidence": ["匹配证据", "主要缺口", "简短理由"]\n}\n\n'
         "请直接输出 JSON 对象本体，不要任何额外文字或 Markdown 包装。"
     )
 
@@ -782,23 +813,14 @@ def validate_llm_score_result(data: Optional[dict], default_score: int = 50) -> 
     return {"score": score, "evidence": evidence}
 
 
-def call_llm_score(task_type: str, resume_profile: dict, jd_profile: dict) -> dict:
-    """LLM 评分入口。task_type ∈ {project_score, direction_score}。失败返回保守分数。"""
-    if task_type not in {"project_score", "direction_score"}:
-        raise ValueError(f"unsupported task_type: {task_type}")
-
+def call_llm_score(resume_profile: dict, jd_profile: dict) -> dict:
+    """LLM 项目匹配度评分（project_score，5 档 rubric）。方向不再走 LLM（改 compute_direction_bonus）。失败返回保守分数。"""
     # 1) 构造裁剪后的输入
-    if task_type == "project_score":
-        resume_subset = _resume_subset_for_project(resume_profile)
-        jd_subset = _jd_subset_for_project(jd_profile)
-        default_score = 50
-    else:
-        resume_subset = _resume_subset_for_direction(resume_profile)
-        jd_subset = _jd_subset_for_direction(jd_profile)
-        # 方向分默认值改为 30：LLM 失败时给「弱相关」保守分，避免回退到偏高的 60
-        default_score = 30
+    resume_subset = _resume_subset_for_project(resume_profile)
+    jd_subset = _jd_subset_for_project(jd_profile)
+    default_score = 50
 
-    user_prompt = _build_user_prompt_for_score(task_type, resume_subset, jd_subset)
+    user_prompt = _build_user_prompt_for_score(resume_subset, jd_subset)
 
     # 2) 调 LLM，捕获异常返回保守分
     try:
@@ -823,7 +845,7 @@ def call_llm_score(task_type: str, resume_profile: dict, jd_profile: dict) -> di
         )
         raw = (completion.choices[0].message.content or "").strip()
     except Exception as e:
-        print(f"[ERROR] LLM 调用失败（{task_type}）：{e}")
+        print(f"[ERROR] LLM 调用失败（project_score）：{e}")
         return {"score": default_score, "evidence": [f"LLM 调用异常：{e}，使用保守分数。"]}
 
     # 3) 解析 + 校验
@@ -834,27 +856,7 @@ def call_llm_score(task_type: str, resume_profile: dict, jd_profile: dict) -> di
 # ===== 5. risk_analysis：Python 规则生成 =====
 _EXPERIENCE_YEAR_PATTERN = re.compile(r"(\d+)\s*[-~]?\s*(\d+)?\s*年")
 
-# 高信号技能缺口类别（领域启发式）：命中则单列为独立风险类型，便于按优先级展示。
-# 每个类别附带 context_keywords：仅当 **JD 本身确实属于该领域**（方向/业务/标题/领域词命中）时才启用，
-# 否则一律回退到通用「技能缺口」。这样可避免「搜索算法 / 采样算法」这类多义词在大模型、
-# 推荐、运筹等岗位里被误标成「机器人运动控制能力缺口」（典型的模板串岗污染）。
-# signal/context 关键词均为小写；signal 与 _normalize_skill 归一形式比对。
-_SKILL_GAP_CATEGORIES = [
-    ("机器人运动控制能力缺口",
-     {"机器人规划控制", "运动控制", "运动规划", "轨迹规划", "轨迹生成",
-      "导航", "机器人运动学", "动力学建模", "搜索算法", "采样算法"},
-     {"机器人", "具身", "运动控制", "规划控制", "轨迹", "导航", "无人机",
-      "自动驾驶", "robot", "embodied", "控制算法", "运动规划"}),
-    ("强化学习/模仿学习能力缺口",
-     {"强化学习", "模仿学习", "ppo", "sac", "rlhf"},
-     {"强化学习", "模仿学习", "reinforcement", " rl ", "具身", "机器人",
-      "决策", "控制", "智能体决策", "多智能体"}),
-    ("机器人仿真与ROS/SLAM能力缺口",
-     {"isaac gym", "mujoco", "pybullet", "ros", "slam", "sim2real",
-      "嵌入式系统开发", "嵌入式"},
-     {"机器人", "具身", "slam", "ros", "仿真", "sim2real", "robot",
-      "自动驾驶", "无人机", "嵌入式", "真机"}),
-]
+# 高信号技能缺口类别 SKILL_GAP_CATEGORIES（含领域门控）已移至 scoring/skill_taxonomy.py（见顶部 import）。
 
 
 def _jd_domain_context(jd_profile: dict) -> str:
@@ -887,7 +889,7 @@ def generate_risk_analysis(
     resume_profile: dict,
     jd_profile: dict,
     skill_score_result: dict,
-    education_score_result: dict,
+    education_gate_result: dict,
 ) -> list:
     """根据规则 + JD 中已有 risk_points 生成结构化风险列表。
 
@@ -897,13 +899,13 @@ def generate_risk_analysis(
       - 候选人已满足学历要求时，过滤掉所有 type 为「学历门槛」的风险（包括 JD 自带）。
     """
     risks: list = []
-    edu_score = education_score_result.get("score", 0)
-    edu_satisfied = edu_score == 100  # 候选人学历完全满足 JD 要求
+    edu_gate = education_gate_result.get("gate")
+    edu_satisfied = edu_gate == "satisfied"  # 候选人学历满足 JD 要求（或无门槛）
 
-    # 1) 学历门槛：仅在候选人确实不满足时才触发
+    # 1) 学历门槛：候选人学历明确低于岗位要求即触发（insufficient 已含专科→本科等差距）
     jd_level = jd_profile.get("education_level")
     resume_degree = resume_profile.get("highest_degree")
-    if jd_level in {"硕士", "博士"} and edu_score == 0 and not edu_satisfied:
+    if edu_gate == "insufficient":
         risks.append(_make_risk(
             type_="学历门槛",
             description=f"岗位要求 {jd_level}，候选人最高学历为 {resume_degree or '未知'}，存在学历差距。",
@@ -953,7 +955,7 @@ def generate_risk_analysis(
         categorized_raw = set()  # 已被某个类别覆盖的原始技能，避免在通用缺口里重复
         jd_ctx = _jd_domain_context(jd_profile)  # 领域门控上下文
 
-        for cat_type, signal_set, context_keywords in _SKILL_GAP_CATEGORIES:
+        for cat_type, signal_set, context_keywords in SKILL_GAP_CATEGORIES:
             # 领域门控：JD 本身不属于该领域时，跳过该专项类别（缺口仍会进通用「技能缺口」），
             # 避免把多义词（如「搜索算法」）在非机器人岗位里错标成机器人运动控制缺口。
             if not any(ck in jd_ctx for ck in context_keywords):
@@ -1017,28 +1019,142 @@ def generate_risk_analysis(
     return deduped
 
 
-# ===== 6 & 7. 总分与等级 =====
-def calculate_final_score(
-    skill_score: int,
-    project_score: int,
-    education_score: int,
-    direction_score: int,
-) -> int:
-    """加权计算 final_score，四舍五入到整数并限制 [0, 100]。"""
+# ===== 6. 基础适配分 match_score（技能 + 项目两维加权）=====
+def calculate_match_score(skill_score: int, project_score: int) -> int:
+    """match_score = skill×0.55 + project×0.45，四舍五入到整数并限制 [0, 100]。"""
     raw = (
         skill_score * DEFAULT_WEIGHTS["skill"]
         + project_score * DEFAULT_WEIGHTS["project"]
-        + education_score * DEFAULT_WEIGHTS["education"]
-        + direction_score * DEFAULT_WEIGHTS["direction"]
     )
     return max(0, min(100, int(round(raw))))
 
 
-def judge_match_level(final_score: int) -> str:
-    """final_score >= 75 -> recommended；50 <= s < 75 -> maybe；< 50 -> not_recommended。"""
-    if final_score >= 75:
+# ===== 6.1 方向偏好加分 direction_bonus（确定性标签映射，取代旧 direction LLM 评分）=====
+# 方向标签词表 DIRECTION_TAG_VOCAB / DIRECTION_PARENTS 见 scoring/direction_tags.py（便于扩词，
+# 含「不放泛词 / 一词只归一标签」两条边界说明）。JD 与用户偏好都映射到标签集合后比较匹配程度。
+def _kw_in_text(kw: str, low: str) -> bool:
+    """关键词命中判断：纯英文 / 缩写用**词边界**匹配（避免 rag⊂storage、bev⊂beverage 等子串误命中），
+    含中文的关键词用子串匹配（中文无词边界）。low 已是小写并首尾加空格。"""
+    k = kw.strip().lower()
+    if not k:
+        return False
+    if k.isascii():
+        return re.search(rf"(?<![a-z0-9]){re.escape(k)}(?![a-z0-9])", low) is not None
+    return k in low
+
+
+def _map_direction_tags(text: str) -> set:
+    """把一段文本映射到方向标签集合（英文词边界 / 中文子串命中即归入）。"""
+    if not isinstance(text, str) or not text.strip():
+        return set()
+    low = f" {text.lower()} "
+    tags = set()
+    for tag, kws in DIRECTION_TAG_VOCAB.items():
+        if any(_kw_in_text(kw, low) for kw in kws):
+            tags.add(tag)
+    return tags
+
+
+def _jd_direction_tags(jd_profile: dict) -> set:
+    """JD 的方向标签集合：综合 direction / business_area / title / domain_keywords。"""
+    parts = [
+        str(jd_profile.get("direction") or ""),
+        str(jd_profile.get("business_area") or ""),
+        str(jd_profile.get("title") or ""),
+        " ".join(str(x) for x in (jd_profile.get("domain_keywords") or [])),
+    ]
+    return _map_direction_tags(" ".join(parts))
+
+
+def compute_direction_bonus(jd_profile: dict, user_direction_tags) -> dict:
+    """岗位方向偏好加分（确定性，≤ DIRECTION_BONUS_CAP）。
+
+    user_direction_tags：用户偏好原始标签（list 或 {tag: weight} dict 的键）。
+    分级（job_matching_and_ranking.md §4.1）：
+      - 核心方向完全一致（标签集合有交集）         +6
+      - 同一上层方向、子方向接近                   +4
+      - 存在弱相关技术交集（偏好词直接出现在 JD 文本）+1~2
+      - 无明显关联                                 +0
+    返回 {bonus, matched_tags, reason}。
+    """
+    if isinstance(user_direction_tags, dict):
+        pref_tags_raw = list(user_direction_tags.keys())
+    elif isinstance(user_direction_tags, (list, tuple, set)):
+        pref_tags_raw = list(user_direction_tags)
+    else:
+        pref_tags_raw = []
+    pref_tags_raw = [str(t).strip() for t in pref_tags_raw if str(t).strip()]
+    if not pref_tags_raw:
+        return {"bonus": 0.0, "matched_tags": [], "reason": "用户未表达方向偏好。"}
+
+    user_tags = _map_direction_tags(" ".join(pref_tags_raw))
+    jd_tags = _jd_direction_tags(jd_profile)
+
+    # 1) 核心方向完全一致：标签集合有交集
+    overlap = user_tags & jd_tags
+    if overlap:
+        return {"bonus": DIRECTION_BONUS_CAP, "matched_tags": sorted(overlap),
+                "reason": f"岗位方向与偏好标签一致（{', '.join(sorted(overlap))}）。"}
+
+    # 2) 同一上层方向、子方向接近：父标签相同
+    user_parents = {DIRECTION_PARENTS.get(t) for t in user_tags if DIRECTION_PARENTS.get(t)}
+    jd_parents = {DIRECTION_PARENTS.get(t) for t in jd_tags if DIRECTION_PARENTS.get(t)}
+    if user_parents & jd_parents:
+        return {"bonus": 4.0, "matched_tags": sorted(user_tags),
+                "reason": "岗位与偏好同属一个上层方向，子方向接近。"}
+
+    # 3) 弱相关：偏好原词直接出现在 JD 文本中
+    hay = " ".join([
+        str(jd_profile.get("direction") or ""),
+        str(jd_profile.get("business_area") or ""),
+        str(jd_profile.get("title") or ""),
+        " ".join(str(x) for x in (jd_profile.get("domain_keywords") or [])),
+        " ".join(str(x) for x in (jd_profile.get("hard_skills") or [])),
+    ]).lower()
+    weak_hits = [t for t in pref_tags_raw if t.lower() in hay]
+    if weak_hits:
+        bonus = 2.0 if len(weak_hits) >= 2 else 1.0
+        return {"bonus": bonus, "matched_tags": weak_hits,
+                "reason": f"岗位与偏好存在弱相关技术交集（{', '.join(weak_hits[:3])}）。"}
+
+    return {"bonus": 0.0, "matched_tags": [], "reason": "岗位方向与用户偏好无明显关联。"}
+
+
+# ===== 6.2 通勤偏好加分 commute_bonus（确定性时长分级，≤ COMMUTE_BONUS_CAP）=====
+def compute_commute_bonus(commute_info: Optional[dict], max_minutes: Optional[int]) -> dict:
+    """通勤偏好加分（job_matching_and_ranking.md §4.2）。
+
+    仅当用户设定了通勤时长上限 max_minutes 时才加分；只要求「展示通勤时间路线」（max_minutes 为 None）→ +0。
+    分级：满足上限 +4 / 接近（≤1.25×）+2 / 超出可接受（≤1.5×）+1 / 明显超出或不可计算 +0。
+    commute_info：{commute_time_minutes, within_limit, ...}（来自 tools/commute）。
+    """
+    if not max_minutes or not isinstance(commute_info, dict):
+        return {"bonus": 0.0, "reason": "未设定通勤时长偏好，仅展示通勤信息不加分。"}
+    minutes = commute_info.get("commute_time_minutes")
+    if not isinstance(minutes, (int, float)):
+        return {"bonus": 0.0, "reason": "通勤时长不可计算，不加分。"}
+    if minutes <= max_minutes:
+        return {"bonus": COMMUTE_BONUS_CAP, "reason": f"通勤约 {int(minutes)} 分钟，满足 {max_minutes} 分钟上限。"}
+    if minutes <= max_minutes * 1.25:
+        return {"bonus": 2.0, "reason": f"通勤约 {int(minutes)} 分钟，接近目标时长。"}
+    if minutes <= max_minutes * 1.5:
+        return {"bonus": 1.0, "reason": f"通勤约 {int(minutes)} 分钟，超出目标但可接受。"}
+    return {"bonus": 0.0, "reason": f"通勤约 {int(minutes)} 分钟，明显超出目标。"}
+
+
+# ===== 6.3 排序分 rank_score =====
+def calculate_rank_score(match_score: int, direction_bonus: float, commute_bonus: float) -> int:
+    """rank_score = min(100, match_score + direction_bonus + commute_bonus)。"""
+    raw = match_score + (direction_bonus or 0.0) + (commute_bonus or 0.0)
+    return max(0, min(100, int(round(raw))))
+
+
+# ===== 7. 推荐等级（按 rank_score）=====
+def judge_match_level(rank_score: int) -> str:
+    """rank_score >= 75 -> recommended（推荐投递）；50~74 -> maybe（可酌情投递）；<50 -> not_recommended（暂不建议）。"""
+    if rank_score >= 75:
         return "recommended"
-    if final_score >= 50:
+    if rank_score >= 50:
         return "maybe"
     return "not_recommended"
 
@@ -1047,19 +1163,17 @@ def judge_match_level(final_score: int) -> str:
 def generate_summary(result: dict) -> str:
     """简洁说明是否推荐 + 主要优势 + 主要风险，不超过 100 字。"""
     level = result.get("match_level")
-    final = result.get("final_score", 0)
+    rank = result.get("rank_score", 0)
     level_text = {
         "recommended": "推荐投递",
         "maybe": "可酌情投递",
         "not_recommended": "暂不建议投递",
     }.get(level, "暂无结论")
 
-    # 主要优势：取最高分维度
+    # 主要优势 / 短板：在技能、项目两维中取
     dim_scores = {
         "技能": result.get("skill_score", {}).get("score", 0),
         "项目": result.get("project_score", {}).get("score", 0),
-        "学历": result.get("education_score", {}).get("score", 0),
-        "方向": result.get("direction_score", {}).get("score", 0),
     }
     top_dim = max(dim_scores.items(), key=lambda kv: kv[1])
     bottom_dim = min(dim_scores.items(), key=lambda kv: kv[1])
@@ -1068,7 +1182,7 @@ def generate_summary(result: dict) -> str:
     risks = result.get("risk_analysis") or []
     risk_text = risks[0].get("type") if risks and isinstance(risks[0], dict) else None
 
-    parts = [f"{level_text}（总分 {final}）"]
+    parts = [f"{level_text}（推荐分 {rank}）"]
     parts.append(f"优势：{top_dim[0]}({top_dim[1]})")
     if bottom_dim[1] < 60:
         parts.append(f"短板：{bottom_dim[0]}({bottom_dim[1]})")
@@ -1083,36 +1197,42 @@ def generate_summary(result: dict) -> str:
 
 
 # ===== 主函数 =====
-def score_match(resume_profile: dict, jd_profile: dict) -> dict:
-    """完整评分流程。"""
+def score_match(resume_profile: dict, jd_profile: dict,
+                user_direction_tags=None) -> dict:
+    """完整评分流程（两层评分）。
+
+    user_direction_tags：用户方向偏好标签（list 或 {tag: weight}），用于 direction_bonus；
+    通勤加分 commute_bonus 在评分阶段未知（通勤在增强节点计算），此处置 0，
+    由 enhancement 节点算完通勤后回填并重算 rank_score。
+    """
     # 1. 技能分（规则）
     skill_result = calculate_skill_score(resume_profile, jd_profile)
-    # 2. 学历分（规则）
+    # 2. 学历分（规则）—— 仅供风险分析的学历门槛判定，不计入评分
     education_result = calculate_education_score(resume_profile, jd_profile)
-    # 3 & 4. 项目分 / 方向分：两次独立 LLM 调用，彼此无依赖，并发执行以省去一次串行等待。
-    # call_llm_score 内部各自新建 client、无共享可变状态，线程安全。
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as _ex:
-        _f_project = _ex.submit(call_llm_score, "project_score", resume_profile, jd_profile)
-        _f_direction = _ex.submit(call_llm_score, "direction_score", resume_profile, jd_profile)
-        project_result = _f_project.result()
-        direction_result = _f_direction.result()
-    # 5. 风险分析（规则 + JD risk_points 合并）
+    # 3. 项目分（LLM，5 档 rubric）
+    project_result = call_llm_score(resume_profile, jd_profile)
+    # 4. 风险分析（规则 + JD risk_points 合并）
     risks = generate_risk_analysis(resume_profile, jd_profile, skill_result, education_result)
-    # 6. 总分（规则加权）
-    final_score = calculate_final_score(
-        skill_result["score"], project_result["score"],
-        education_result["score"], direction_result["score"],
-    )
-    # 7. 等级
-    match_level = judge_match_level(final_score)
+    # 5. 基础适配分 match_score（技能 + 项目两维加权）
+    match_score = calculate_match_score(skill_result["score"], project_result["score"])
+    # 6. 方向偏好加分（确定性标签映射）；通勤加分评分阶段为 0
+    direction_bonus_info = compute_direction_bonus(jd_profile, user_direction_tags)
+    direction_bonus = direction_bonus_info["bonus"]
+    commute_bonus = 0.0
+    # 7. 排序分 rank_score + 推荐等级
+    rank_score = calculate_rank_score(match_score, direction_bonus, commute_bonus)
+    match_level = judge_match_level(rank_score)
 
     result = {
         "skill_score": skill_result,
         "project_score": project_result,
-        "education_score": education_result,
-        "direction_score": direction_result,
+        "education_gate": education_result,  # 学历门槛三态，仅供风险/语气，不计入评分
         "risk_analysis": risks,
-        "final_score": final_score,
+        "match_score": match_score,
+        "direction_bonus": direction_bonus,
+        "direction_bonus_info": direction_bonus_info,
+        "commute_bonus": commute_bonus,
+        "rank_score": rank_score,
         "match_level": match_level,
         "summary": "",
     }

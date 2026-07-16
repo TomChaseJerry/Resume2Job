@@ -14,8 +14,11 @@ need_interview，据通勤诉求产出 need_commute）决定，本节点按开�
 通勤参数取自 planner 写入的 state["commute_intent"]（不再由 LLM tool-calling 传参）。
 """
 
+import time
+
 from resume2job.agent.state import AgentState
 from resume2job.agent.nodes.executor import append_error, get_plan_flag
+from resume2job.observability import events
 from resume2job.generation.learning_plan import build_learning_plan
 from resume2job.generation.interview import generate_interview_questions
 from resume2job.tools.commute import compute_and_rank
@@ -181,13 +184,24 @@ def enhancement_node(state: AgentState) -> AgentState:
     print("[enhancement_node] 开始执行...")
     executed = []
     if get_plan_flag(state, "need_commute"):
+        t0 = time.perf_counter()
         state = _run_commute(state)
+        events.record_tool_call("commute", (time.perf_counter() - t0) * 1000,
+                                summary={"n_results": len(state.get("commute_results") or [])})
         executed.append("commute")
     if get_plan_flag(state, "need_learning_plan"):
+        t0 = time.perf_counter()
         state = _run_learning_plan(state)
+        lp = state.get("learning_plan") or {}
+        events.record_tool_call("learning_plan", (time.perf_counter() - t0) * 1000,
+                                ok=not lp.get("error"), summary={"stages": len(lp.get("stages") or [])})
         executed.append("learning_plan")
     if get_plan_flag(state, "need_interview"):
+        t0 = time.perf_counter()
         state = _run_interview(state)
+        ip = state.get("interview_prep") or {}
+        events.record_tool_call("interview", (time.perf_counter() - t0) * 1000,
+                                ok=not ip.get("error"), summary={"questions": len(ip.get("questions") or [])})
         executed.append("interview")
 
     if executed:

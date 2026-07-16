@@ -40,7 +40,7 @@ DASHSCOPE_NATIVE_URL = _env(
 # ===== 主对话 / 生成模型 =====
 # 用于：简历解析、JD 解析、推荐写作、技能差距、学习计划、面试准备、
 #       匹配打分主模型、检索 query 改写等需要较强推理的场景。
-CHAT_MODEL = _env("RESUME2JOB_CHAT_MODEL", "deepseek-v4-pro")
+CHAT_MODEL = _env("RESUME2JOB_CHAT_MODEL", "glm-5")
 
 # ===== 轻量模型 =====
 # 规划（intent + job_source + assist_actions + 硬约束 + 通勤的 Function Calling 结构化输出）：输出短、规则明确。

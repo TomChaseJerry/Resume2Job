@@ -67,6 +67,8 @@ from resume2job.retrieval.rerank import rerank_hits
 from resume2job.storage import jobs_store
 # 硬约束归一（城市 / 岗位类型）；学历分级 DEGREE_RANK 供节点把候选人学历映射成 rank
 from resume2job.parsing.jd_parser import normalize_city, normalize_job_type, DEGREE_RANK
+# 请求级链路追踪（Stage 2）：记录各阶段候选与分数快照；无活跃 trace 时全部 no-op
+from resume2job.observability import events
 
 
 # ===== 请求级硬约束对象（城市 / 学历 / 岗位类型）=====
@@ -778,6 +780,9 @@ def retrieve_jobs(
     eligible = jobs_store.get_eligible_jobs(
         constraints.city, constraints.user_degree_rank, constraints.job_type)
     allowed_job_ids = set(eligible)
+    events.record_constraint_filter(
+        {"city": constraints.city, "user_degree_rank": constraints.user_degree_rank,
+         "job_type": constraints.job_type}, allowed_count=len(allowed_job_ids))
     if not allowed_job_ids:
         print(f"[INFO] 硬约束预筛无 eligible 岗位（城市={constraints.city} / "
               f"学历rank={constraints.user_degree_rank} / 类型={constraints.job_type}），返回空。")
@@ -830,11 +835,13 @@ def retrieve_jobs(
         if use_vector:
             hits = _finalize_hits(_query_once(collection, query_text, per_query_k, allowed_job_ids), query_text)
             print(f"[INFO]   向量通道返回：{len(hits)} 条")
+            events.record_channel_hits("dense", hits)
             if hits:
                 ranked_lists.append(hits)
         if use_bm25:
             hits = _finalize_hits(_bm25_query_once(bm25_corpus, query_text, per_query_k, allowed_job_ids), query_text)
             print(f"[INFO]   BM25 通道返回：{len(hits)} 条")
+            events.record_channel_hits("bm25", hits)
             if hits:
                 ranked_lists.append(hits)
 
@@ -842,14 +849,17 @@ def retrieve_jobs(
     # 只增强目标方向召回（多一路名次支持而上浮），**同样限定 allowed_job_ids**，剔除通用基础能力。
     q3_terms = list((preferences or {}).keys()) or _resume_intentions(resume_profile)
     query_3 = _strip_general_base_skills(_normalize_query_text(" ".join(q3_terms)))
+    events.record_retrieval_queries({**queries, "query_3": query_3})  # 记录三路 Query（含偏好召回）
     if query_3.strip():
         print(f"[INFO] 执行方向偏好召回（Query3）：{query_3}")
         if use_vector:
             h = _finalize_hits(_query_once(collection, query_3, per_query_k, allowed_job_ids), query_3)
+            events.record_channel_hits("dense", h)
             if h:
                 ranked_lists.append(h)
         if use_bm25:
             h = _finalize_hits(_bm25_query_once(bm25_corpus, query_3, per_query_k, allowed_job_ids), query_3)
+            events.record_channel_hits("bm25", h)
             if h:
                 ranked_lists.append(h)
 
@@ -858,6 +868,7 @@ def retrieve_jobs(
         print("[INFO] 所有 Query 均无召回结果，返回空列表。")
         return []
     print(f"[INFO] RRF 融合去重后：{len(merged)} 条（模式：{mode}，硬约束已在召回前预筛）")
+    events.record_rrf(merged)
 
     # 3.5) 把资格状态附到命中（city_match_status / education_match_status，供报告标「地点待确认」等）
     for h in merged:
@@ -873,6 +884,7 @@ def retrieve_jobs(
         candidates = rerank_hits(rerank_query, candidates, top_n=len(candidates))
         if candidates and "rerank_score" in candidates[0]:
             print(f"[INFO] rerank 精排完成：{len(candidates)} 条候选已按相关性重排")
+        events.record_rerank(candidates)
 
     # 排序偏好统一到评分层 direction_bonus，检索阶段不再做 α-blend 加权重排。
 

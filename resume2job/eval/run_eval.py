@@ -53,9 +53,17 @@ def main(argv=None) -> int:
     parser.add_argument("--judge", nargs=2, metavar=("RESUME_JSON", "JD_FILE"),
                         help="端到端生成推荐报告并 LLM-as-judge 打分")
     parser.add_argument("--top_k", type=int, default=5, help="检索评测 top_k")
+    # 四层评测（Stage 4）：抽取 / Planner / 排序运营 / 曝光审计——除 --extraction-reparse 外均 0 LLM
+    parser.add_argument("--extraction", action="store_true", help="抽取层评测（JD 抽取完整度/质量，用已入库画像，0 LLM）")
+    parser.add_argument("--extraction-reparse", action="store_true", help="抽取层评测时重跑 parse_jd 测 JSON 合法率（需 API）")
+    parser.add_argument("--planner", action="store_true", help="Planner 层评测（挖 planner_traces，0 LLM）")
+    parser.add_argument("--ranking", action="store_true", help="排序运营/约束/成本评测（挖 request_traces，0 LLM）")
+    parser.add_argument("--fairness", action="store_true", help="曝光与数据质量审计（0 LLM）")
+    parser.add_argument("--gold", default=None, help="extraction / planner 评测的 gold jsonl（可选，算准确率）")
     args = parser.parse_args(argv)
 
-    if not (args.build or args.retrieval or args.judge):
+    if not (args.build or args.retrieval or args.judge or args.extraction
+            or args.planner or args.ranking or args.fairness):
         parser.print_help()
         return 1
 
@@ -69,6 +77,27 @@ def main(argv=None) -> int:
 
     if args.judge:
         _judge_end_to_end(args.judge[0], args.judge[1])
+
+    if args.extraction:
+        from resume2job.eval.extraction_eval import evaluate_jd_extraction
+        rep = evaluate_jd_extraction(source="reparse" if args.extraction_reparse else "store",
+                                     gold_path=args.gold)
+        print(json.dumps(rep, ensure_ascii=False, indent=2))
+
+    if args.planner:
+        from resume2job.eval.planner_eval import run_planner_eval
+        rep = run_planner_eval(gold_path=args.gold)
+        print(json.dumps(rep, ensure_ascii=False, indent=2))
+
+    if args.ranking:
+        from resume2job.eval.ranking_eval import run_ranking_eval
+        rep = run_ranking_eval(with_relevance=args.retrieval)
+        print(json.dumps(rep, ensure_ascii=False, indent=2))
+
+    if args.fairness:
+        from resume2job.eval.fairness_audit import run_fairness_audit
+        rep = run_fairness_audit()
+        print(json.dumps(rep, ensure_ascii=False, indent=2))
 
     return 0
 

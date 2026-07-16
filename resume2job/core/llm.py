@@ -33,6 +33,18 @@ def get_api_key() -> str:
 
 
 # ---------------------------------------------------------------------------
+# 可观测性挂钩（Stage 2）：把每次 LLM / Embedding 调用的 token + 时延记入当前 request trace。
+# 无活跃 trace 时为 no-op；任何异常都被吞掉，绝不影响真实调用。
+# ---------------------------------------------------------------------------
+def _record_llm_usage(kind: str, model: str, usage, latency_ms: float) -> None:
+    try:
+        from resume2job.observability import events
+        events.record_llm_call(kind, model, usage, latency_ms)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # LLM 调用
 # ---------------------------------------------------------------------------
 
@@ -46,17 +58,22 @@ def call_llm(
 
     默认低温度（抽取 / 打分类任务结构稳定）；生成类任务可自行调高。
     """
+    import time
     from openai import OpenAI  # 延迟导入，避免无依赖环境 import 期失败
 
+    used_model = model or config.CHAT_MODEL
     client = OpenAI(api_key=get_api_key(), base_url=config.BASE_URL)
+    t0 = time.perf_counter()
     completion = client.chat.completions.create(
-        model=model or config.CHAT_MODEL,
+        model=used_model,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
         temperature=temperature,
     )
+    _record_llm_usage("chat", used_model, getattr(completion, "usage", None),
+                      (time.perf_counter() - t0) * 1000.0)
     return (completion.choices[0].message.content or "").strip()
 
 
@@ -98,10 +115,14 @@ def get_embedding(text: str) -> list:
     if not isinstance(text, str) or not text.strip():
         raise ValueError("get_embedding 输入文本为空")
 
+    import time
     from openai import OpenAI  # 延迟导入
 
     client = OpenAI(api_key=get_api_key(), base_url=config.BASE_URL)
+    t0 = time.perf_counter()
     resp = client.embeddings.create(model=config.EMBEDDING_MODEL, input=text)
+    _record_llm_usage("embedding", config.EMBEDDING_MODEL, getattr(resp, "usage", None),
+                      (time.perf_counter() - t0) * 1000.0)
     return list(resp.data[0].embedding)
 
 

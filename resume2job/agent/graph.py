@@ -32,11 +32,13 @@ agent/graph.py
 
 import argparse
 import time
+import uuid
 
 from langgraph.graph import StateGraph, START, END
 
 from resume2job.agent.state import AgentState, get_initial_state
 from resume2job.agent.trace import TurnTrace, summarize_state, changed_keys
+from resume2job.observability import events
 from resume2job.agent.planner import planner_node
 from resume2job.agent.nodes.executor import (
     resume_parser_node,
@@ -93,20 +95,32 @@ def route_job_source(state: AgentState) -> str:
 # 构建工作流图
 # ---------------------------------------------------------------------------
 
+def _observed(name: str, fn):
+    """包住节点：经 events.run_node 记录每节点时延 + 设「当前节点」（供 LLM token 归属）。
+
+    无活跃 request trace 时 run_node 直接透传（零开销旁路），故 run_turn_traced / pipeline / 直接
+    invoke 均不受影响——只有 run_turn 开了 request_scope 的链路才会被观测。
+    """
+    def _wrapped(state):
+        return events.run_node(name, fn, state)
+    _wrapped.__name__ = getattr(fn, "__name__", name)
+    return _wrapped
+
+
 def build_graph():
     """组装并编译 LangGraph 工作流，返回可执行 app。"""
     graph = StateGraph(AgentState)
 
-    # 1. 注册节点（route_job_source 是路由函数，不在此注册）
-    graph.add_node("planner", planner_node)              # Function Calling 规划
-    graph.add_node("resume_parser", resume_parser_node)
-    graph.add_node("profile_cache", profile_cache_node)  # 画像缓存：复用 / 保存用户画像
-    graph.add_node("job_retriever", job_retriever_node)  # 混合检索召回
-    graph.add_node("jd_input", jd_input_node)
-    graph.add_node("jd_ingest", jd_ingest_node)          # 粘贴 JD 自动去重入库
-    graph.add_node("jd_analyzer", jd_analyzer_node)
-    graph.add_node("match_scorer", match_scorer_node)
-    graph.add_node("enhancements", enhancement_node)     # Tool Calling 可选增强
+    # 1. 注册节点（route_job_source 是路由函数，不在此注册）；每个节点包一层观测旁路
+    graph.add_node("planner", _observed("planner", planner_node))              # Function Calling 规划
+    graph.add_node("resume_parser", _observed("resume_parser", resume_parser_node))
+    graph.add_node("profile_cache", _observed("profile_cache", profile_cache_node))  # 画像缓存：复用 / 保存用户画像
+    graph.add_node("job_retriever", _observed("job_retriever", job_retriever_node))  # 混合检索召回
+    graph.add_node("jd_input", _observed("jd_input", jd_input_node))
+    graph.add_node("jd_ingest", _observed("jd_ingest", jd_ingest_node))          # 粘贴 JD 自动去重入库
+    graph.add_node("jd_analyzer", _observed("jd_analyzer", jd_analyzer_node))
+    graph.add_node("match_scorer", _observed("match_scorer", match_scorer_node))
+    graph.add_node("enhancements", _observed("enhancements", enhancement_node))     # Tool Calling 可选增强
 
     # 2. 固定边：入口 -> 规划 -> 简历解析 -> 画像缓存
     graph.add_edge(START, "planner")
@@ -255,12 +269,23 @@ def run_turn(
         messages=history,
     )
 
-    final_state = app.invoke(initial_state)
+    # 请求级链路追踪（Stage 2）：分配 request_id，开 request_scope（退出时落盘 trace）。
+    # 各节点 / core.llm / retriever 沿途经 contextvar 记录器写快照；失败不影响主链路。
+    turn_no = len(history) // 2 + 1
+    request_id = f"req-{turn_no}-{uuid.uuid4().hex[:10]}"
+    with events.request_scope(request_id, session_id, user_query,
+                              model_versions=events.snapshot_model_versions(),
+                              index_version=events.snapshot_index_version()):
+        final_state = app.invoke(initial_state)
+        events.record_state_errors((final_state or {}).get("errors") or [])
 
     # 记录本轮对话（user + assistant）+ 写会话短期状态（供下一轮指代）
     response = _summarize_response(final_state)
     conversation_store.append_turn(session_id, user_query, response)
     _persist_session(session_id, final_state)
+    # 把 request_id 附到返回（replay / 调用方关联用；额外键，不影响 State 通道）
+    final_state = dict(final_state)
+    final_state["request_id"] = request_id
     return final_state
 
 

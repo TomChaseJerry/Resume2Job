@@ -14,6 +14,7 @@ from resume2job.agent.planner import (
     policy_orchestrator, trace_logger,
 )
 from resume2job.agent.planner.schema import PlannerOutput
+from resume2job.observability import events
 
 # 通勤约束触发时扩大召回，保证有足够候选供过滤
 COMMUTE_TOP_K = 10
@@ -112,6 +113,15 @@ def planner_node(state: dict) -> dict:
 
     # 6. trace 落库
     trace_logger.log(state.get("session_id") or "", ctx.current_message, out, plan, decided_by)
+    # 6.5 请求级 trace：记录本轮 query_plan（与 planner_traces 互补，挂当前 request trace；无 trace 时 no-op）
+    events.record_query_plan({
+        "intent": out.intent,
+        "session_action": plan.get("session_action"),
+        "hard_constraints": out.hard_constraints or {},
+        "soft_preferences": out.soft_preferences or {},
+        "clarify": bool(plan.get("clarify")),
+        "decided_by": decided_by,
+    })
 
     # ---- 写回 State ----
     new_state["plan"] = plan

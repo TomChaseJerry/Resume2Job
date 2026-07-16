@@ -17,6 +17,7 @@ nodes/executor.py
 
 import re
 import json
+import contextvars
 import concurrent.futures
 from typing import Optional
 
@@ -323,6 +324,11 @@ def jd_analyzer_node(state: AgentState) -> AgentState:
         for idx, candidate in enumerate(candidate_jobs):
             jd_profile = extract_jd_profile_from_candidate(candidate)
             if jd_profile:
+                # 带上检索命中的规范 job_id（如 jd_test_1），让评分结果 / 会话候选池 / 观测 trace 都用
+                # 同一个 job_id，而非回退到 company+title 合成 id（否则与检索/jobs 表无法对齐）。
+                cand_id = candidate.get("job_id")
+                if cand_id and not jd_profile.get("job_id"):
+                    jd_profile = {**jd_profile, "job_id": cand_id}
                 jd_profiles.append(jd_profile)
             else:
                 # 单个岗位无法提取 -> 记录 warning 并跳过，不中断
@@ -434,7 +440,10 @@ def _narrate_batch(batch: list, resume_profile: dict, errors: list) -> None:
         return
     workers = min(8, len(batch))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(_ensure_narrated, mr, resume_profile, errors) for mr in batch]
+        # 把当前 contextvar 上下文（含 request trace / 当前节点）复制进工作线程——否则线程内 LLM 调用
+        # 的 token/时延记不进 request trace（contextvars 不会自动传播到 ThreadPoolExecutor）。
+        futs = [ex.submit(contextvars.copy_context().run, _ensure_narrated, mr, resume_profile, errors)
+                for mr in batch]
         for fut in concurrent.futures.as_completed(futs):
             try:
                 fut.result()
@@ -446,6 +455,42 @@ def _display_k(state: AgentState) -> int:
     """本轮展示岗位数（用户请求数）；候选池可比它大，供换一批/重排复用。"""
     cfg = state.get("retrieval_config") or {}
     return max(1, int(cfg.get("display_k") or cfg.get("top_k") or 5))
+
+
+def _record_ranking_observability(shown: list, pool: Optional[list] = None) -> None:
+    """把评分 / 排序快照写入当前 request trace（Stage 2；无活跃 trace 时 no-op）。
+
+    rank_features 取整池（含未展示，project 可能 pending）——供 Stage 3 排序学习的特征行；
+    final_ranked_jobs 取展示批次——最终呈现给用户的名次（replay 对比的主对象）。
+    """
+    try:
+        from resume2job.observability import events
+        if events.current() is None:
+            return
+        feats = []
+        for r in (pool or shown or []):
+            if not isinstance(r, dict):
+                continue
+            ms = r.get("match_score") or {}
+            jd = r.get("jd_profile") or {}
+            eg = ms.get("education_gate")
+            feats.append({
+                "job_id": r.get("job_id"), "company": jd.get("company"), "title": jd.get("title"),
+                "skill_score": ms.get("skill_score"), "project_score": ms.get("project_score"),
+                "project_pending": ms.get("project_pending"), "match_score": ms.get("match_score"),
+                "direction_bonus": ms.get("direction_bonus"), "commute_bonus": ms.get("commute_bonus"),
+                "rank_score": ms.get("rank_score"), "match_level": ms.get("match_level"),
+                "education_gate": (eg.get("gate") if isinstance(eg, dict) else eg),
+            })
+        events.record_rank_features(feats)
+        events.record_final_ranked([
+            {"job_id": r.get("job_id"), "rank": i + 1,
+             "rank_score": (r.get("match_score") or {}).get("rank_score"),
+             "match_level": (r.get("match_score") or {}).get("match_level")}
+            for i, r in enumerate(shown or []) if isinstance(r, dict)
+        ])
+    except Exception:
+        pass
 
 
 def _serve_next_batch(state: AgentState) -> AgentState:
@@ -469,6 +514,7 @@ def _serve_next_batch(state: AgentState) -> AgentState:
     _finalize_projects(batch, resume_profile, errors)  # 惰性精算新展示岗位的 project
     batch.sort(key=lambda r: (r.get("match_score") or {}).get("rank_score", 0), reverse=True)
     _narrate_batch(batch, resume_profile, errors)  # 惰性叙述新展示岗位
+    _record_ranking_observability(batch, pool)
     new_state["candidate_pool"] = pool  # 池项被就地写入精算/叙述缓存，整池回存
     new_state["match_results"] = batch
     new_state["shown_job_ids"] = list(shown | {r.get("job_id") for r in batch})
@@ -509,6 +555,7 @@ def _rerank_pool(state: AgentState) -> AgentState:
     _finalize_projects(batch, resume_profile, errors)  # 精算进入展示的岗位 project（pending 的才调 LLM）
     batch.sort(key=lambda r: (r.get("match_score") or {}).get("rank_score", 0), reverse=True)
     _narrate_batch(batch, resume_profile, errors)  # 缓存→重组报告刷新分数，新岗位→LLM
+    _record_ranking_observability(batch, pool)
     new_state = dict(state)
     new_state["candidate_pool"] = pool
     new_state["match_results"] = batch
@@ -588,6 +635,7 @@ def match_scorer_node(state: AgentState) -> AgentState:
     _finalize_projects(shown, resume_profile, errors)
     shown.sort(key=lambda r: (r.get("match_score") or {}).get("rank_score", 0), reverse=True)
     _narrate_batch(shown, resume_profile, errors)
+    _record_ranking_observability(shown, pool)
 
     new_state["candidate_pool"] = pool                  # 候选池（展示 Top-N 已精算 project，其余惰性待精算）供换一批/重排
     new_state["match_results"] = shown

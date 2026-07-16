@@ -50,6 +50,17 @@ CREATE TABLE IF NOT EXISTS jobs (
     min_degree_rank INTEGER,                            -- 最低学历 rank（本1硕2博3）；NULL=不限/未明确
     city_status     TEXT NOT NULL DEFAULT 'unknown',    -- explicit / unknown
     education_status TEXT NOT NULL DEFAULT 'unknown',   -- explicit / unrestricted / unknown
+    -- 生命周期 / 版本 / 质量列（由 resume2job/ingest 写入；见 ingest/models.py、ingest/versions.py）
+    status          TEXT NOT NULL DEFAULT 'active',     -- active / expired / removed（仅 active 可召回）
+    source_job_id   TEXT,                               -- 来源系统外部 ID（增量同步 / 去重）
+    canonical_url   TEXT,                               -- 岗位规范 URL（按 URL 去重 / 增量更新）
+    content_hash    TEXT,                               -- index_text 内容哈希（驱动重嵌入判断）
+    collected_at    TEXT,                               -- 来源采集时间（ISO）
+    last_verified_at TEXT,                              -- 最近确认仍有效的时间（ISO）
+    parser_version  TEXT,                               -- 解析器版本戳
+    embedding_version TEXT,                             -- embedding 版本戳（= 模型名）
+    index_text_version TEXT,                            -- index_text 拼接版本戳
+    quality_score   REAL,                               -- 质量分 [0,1]（ingest/validator）
     created_at      TEXT NOT NULL,
     updated_at      TEXT
 );
@@ -62,6 +73,12 @@ CREATE INDEX IF NOT EXISTS idx_jobs_city ON jobs(city);
 """
 _CREATE_HASH_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_jobs_hash ON jobs(jd_hash);
+"""
+_CREATE_STATUS_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+"""
+_CREATE_URL_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_jobs_canonical_url ON jobs(canonical_url);
 """
 
 # 旧库（2026-06 重构前建的表）缺这些列，init_db 时幂等补齐
@@ -77,6 +94,17 @@ _MIGRATION_COLUMNS = (
     ("min_degree_rank", "INTEGER"),
     ("city_status", "TEXT NOT NULL DEFAULT 'unknown'"),
     ("education_status", "TEXT NOT NULL DEFAULT 'unknown'"),
+    # 生命周期 / 版本 / 质量列（2026-06 加；旧库 ALTER 补齐，再跑 ingest.lifecycle.backfill_lifecycle_fields 回填值）
+    ("status", "TEXT NOT NULL DEFAULT 'active'"),
+    ("source_job_id", "TEXT"),
+    ("canonical_url", "TEXT"),
+    ("content_hash", "TEXT"),
+    ("collected_at", "TEXT"),
+    ("last_verified_at", "TEXT"),
+    ("parser_version", "TEXT"),
+    ("embedding_version", "TEXT"),
+    ("index_text_version", "TEXT"),
+    ("quality_score", "REAL"),
 )
 
 
@@ -106,14 +134,26 @@ def init_db() -> None:
             conn.execute(_CREATE_UNIQUE_INDEX_SQL)
             conn.execute(_CREATE_CITY_INDEX_SQL)
             conn.execute(_CREATE_HASH_INDEX_SQL)
+            conn.execute(_CREATE_STATUS_INDEX_SQL)
+            conn.execute(_CREATE_URL_INDEX_SQL)
             conn.commit()
     except Exception as e:
         print(f"[jobs_store] 警告：初始化 jobs 表失败：{e}")
 
 
 def compute_jd_hash(jd_text: str) -> str:
-    """对 jd_text.strip() 做 MD5，返回十六进制字符串（精确去重键）。"""
+    """对 jd_text.strip() 做 MD5，返回十六进制字符串（精确去重键 / 原文变更检测）。"""
     return hashlib.md5((jd_text or "").strip().encode("utf-8")).hexdigest()
+
+
+def compute_content_hash(index_text: str) -> str:
+    """对 index_text.strip() 做 MD5：归一后**检索文本**（送 embedding / BM25 的文本）的内容指纹。
+
+    与 compute_jd_hash 分工：jd_hash 反映原文是否变；content_hash 反映检索文本是否变——
+    解析结果或 index_text 拼接逻辑（INDEX_TEXT_VERSION）改了，即便原文一致它也会变，
+    用于判断 Chroma 向量是否需要重嵌入。失败返回空串。
+    """
+    return hashlib.md5((index_text or "").strip().encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -134,9 +174,11 @@ def upsert_job(job: dict) -> None:
 
     with _conn() as conn:
         row = conn.execute(
-            "SELECT created_at FROM jobs WHERE job_id = ?", (job["job_id"],)
+            "SELECT created_at, collected_at FROM jobs WHERE job_id = ?", (job["job_id"],)
         ).fetchone()
-        created_at = row["created_at"] if row else (job.get("created_at") or now)
+        created_at = (row["created_at"] if row else None) or job.get("created_at") or now
+        # collected_at（来源采集时间）：入参优先 → 既有保留 → 回退 created_at（首次入库）
+        collected_at = job.get("collected_at") or (row["collected_at"] if row else None) or created_at
 
         conn.execute(
             "INSERT OR REPLACE INTO jobs "
@@ -144,8 +186,11 @@ def upsert_job(job: dict) -> None:
             " jd_text, jd_hash, jd_profile_json, index_text, "
             " requirements, skills, source, embedding_id, "
             " cities_json, job_types_json, min_degree_rank, city_status, education_status, "
+            " status, source_job_id, canonical_url, content_hash, collected_at, last_verified_at, "
+            " parser_version, embedding_version, index_text_version, quality_score, "
             " created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 job["job_id"],
                 job.get("company") or "unknown_company",
@@ -167,6 +212,17 @@ def upsert_job(job: dict) -> None:
                 job.get("min_degree_rank"),
                 job.get("city_status") or "unknown",
                 job.get("education_status") or "unknown",
+                # 生命周期 / 版本 / 质量列（ingest 写入；缺省 status=active、last_verified_at=now）
+                job.get("status") or "active",
+                job.get("source_job_id"),
+                job.get("canonical_url"),
+                job.get("content_hash"),
+                collected_at,
+                job.get("last_verified_at") or now,
+                job.get("parser_version"),
+                job.get("embedding_version"),
+                job.get("index_text_version"),
+                job.get("quality_score"),
                 created_at,
                 now,
             ),
@@ -342,7 +398,7 @@ def get_eligible_jobs(city, user_degree_rank, job_type) -> Dict[str, dict]:
         with _conn() as conn:
             rows = conn.execute(
                 "SELECT job_id, cities_json, min_degree_rank FROM jobs "
-                "WHERE index_text != '' "
+                "WHERE index_text != '' AND status = 'active' "
                 "  AND (:rank IS NULL OR min_degree_rank IS NULL OR min_degree_rank <= :rank) "
                 "  AND (job_types_json = '[]' "
                 "       OR EXISTS (SELECT 1 FROM json_each(job_types_json) WHERE value = :jt)) "
@@ -386,6 +442,140 @@ def update_constraint_fields(job_id: str, cities_json, job_types_json,
             conn.commit()
     except Exception as e:
         print(f"[jobs_store] 警告：回填约束列失败 {job_id}：{e}")
+
+
+# ---------------------------------------------------------------------------
+# 生命周期 / 去重 / 回填（ingest 模块用）
+# ---------------------------------------------------------------------------
+def get_job_id_by_canonical_url(url: str) -> Optional[str]:
+    """按岗位规范 URL 查 job_id（增量同步 / URL 去重）；未命中返回 None。"""
+    if not url:
+        return None
+    try:
+        with _conn() as conn:
+            row = conn.execute(
+                "SELECT job_id FROM jobs WHERE canonical_url = ? LIMIT 1", (url,)
+            ).fetchone()
+        return row["job_id"] if row else None
+    except Exception:
+        return None
+
+
+def get_job_id_by_source(source: str, source_job_id: str) -> Optional[str]:
+    """按 (source, source_job_id) 查 job_id（来源系统外部 ID 去重）；未命中返回 None。"""
+    if not source or not source_job_id:
+        return None
+    try:
+        with _conn() as conn:
+            row = conn.execute(
+                "SELECT job_id FROM jobs WHERE source = ? AND source_job_id = ? LIMIT 1",
+                (source, source_job_id),
+            ).fetchone()
+        return row["job_id"] if row else None
+    except Exception:
+        return None
+
+
+def touch_verified(job_id: str, now_iso: Optional[str] = None) -> None:
+    """确认岗位仍有效：status→active、刷新 last_verified_at（幂等接入的轻量更新，不动 updated_at）。"""
+    if not job_id:
+        return
+    now = now_iso or _utc_now_iso()
+    try:
+        with _conn() as conn:
+            conn.execute(
+                "UPDATE jobs SET status='active', last_verified_at=? WHERE job_id=?",
+                (now, job_id),
+            )
+            conn.commit()
+    except Exception as e:
+        print(f"[jobs_store] 警告：touch_verified 失败 {job_id}：{e}")
+
+
+def set_status(job_id: str, status: str, now_iso: Optional[str] = None) -> None:
+    """设置岗位生命周期状态（active/expired/removed）；置 active 时可同时刷新 last_verified_at。"""
+    if not job_id or not status:
+        return
+    try:
+        with _conn() as conn:
+            if now_iso:
+                conn.execute("UPDATE jobs SET status=?, last_verified_at=? WHERE job_id=?",
+                             (status, now_iso, job_id))
+            else:
+                conn.execute("UPDATE jobs SET status=? WHERE job_id=?", (status, job_id))
+            conn.commit()
+    except Exception as e:
+        print(f"[jobs_store] 警告：set_status 失败 {job_id}：{e}")
+
+
+def update_embedding_version(job_id: str, embedding_version: Optional[str]) -> None:
+    """写入岗位对应向量的 embedding 版本戳（Chroma 写入成功后调用）。"""
+    if not job_id:
+        return
+    try:
+        with _conn() as conn:
+            conn.execute("UPDATE jobs SET embedding_version=? WHERE job_id=?",
+                         (embedding_version, job_id))
+            conn.commit()
+    except Exception as e:
+        print(f"[jobs_store] 警告：update_embedding_version 失败 {job_id}：{e}")
+
+
+def expire_stale(cutoff_iso: str) -> int:
+    """把 active 且 last_verified_at 早于 cutoff 的岗位标记为 expired，返回条数。
+
+    last_verified_at 为 NULL（从未验证 / 未回填）的不动——避免在回填前误过期旧库。
+    """
+    try:
+        with _conn() as conn:
+            cur = conn.execute(
+                "UPDATE jobs SET status='expired' "
+                "WHERE status='active' AND last_verified_at IS NOT NULL AND last_verified_at < ?",
+                (cutoff_iso,),
+            )
+            conn.commit()
+            return cur.rowcount or 0
+    except Exception as e:
+        print(f"[jobs_store] 警告：expire_stale 失败：{e}")
+        return 0
+
+
+def update_lifecycle_fields(job_id: str, *, status=None, content_hash=None,
+                            parser_version=None, embedding_version=None,
+                            index_text_version=None, quality_score=None,
+                            collected_at=None, last_verified_at=None) -> None:
+    """回填 / 更新生命周期 + 版本 + 质量列（只动给定的非 None 列）。"""
+    if not job_id:
+        return
+    cols = [("status", status), ("content_hash", content_hash),
+            ("parser_version", parser_version), ("embedding_version", embedding_version),
+            ("index_text_version", index_text_version), ("quality_score", quality_score),
+            ("collected_at", collected_at), ("last_verified_at", last_verified_at)]
+    sets, vals = [], []
+    for col, val in cols:
+        if val is not None:
+            sets.append(f"{col}=?")
+            vals.append(val)
+    if not sets:
+        return
+    vals.append(job_id)
+    try:
+        with _conn() as conn:
+            conn.execute(f"UPDATE jobs SET {', '.join(sets)} WHERE job_id=?", vals)
+            conn.commit()
+    except Exception as e:
+        print(f"[jobs_store] 警告：update_lifecycle_fields 失败 {job_id}：{e}")
+
+
+def all_rows() -> List[dict]:
+    """取全部岗位的完整行（含反序列化 jd_profile）；生命周期回填 / 审计用。"""
+    try:
+        with _conn() as conn:
+            rows = conn.execute("SELECT * FROM jobs").fetchall()
+        return [_row_to_dict(r) for r in rows]
+    except Exception as e:
+        print(f"[jobs_store] 警告：读取全量行失败：{e}")
+        return []
 
 
 # 模块首次导入时建表（幂等，与 profile_cache / conversation_store 约定一致）

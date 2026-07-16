@@ -24,10 +24,8 @@ from typing import Optional
 
 import chromadb
 
-# 复用已有的 JD 解析器
-from resume2job.parsing.jd_parser import parse_jd, derive_constraint_fields, infer_job_type
-# 统一 Embedding（core 层单一事实来源）
-from resume2job.core.llm import get_embedding
+# 复用已有的 JD 解析器（infer_job_type/derive 供回填用；批量建库的 parse/embed 已下沉到 ingest.lifecycle）
+from resume2job.parsing.jd_parser import derive_constraint_fields, infer_job_type
 # jobs 表统一读写（SQLite 事实源，与运行时 jd_ingest_node 共用）
 from resume2job.storage import jobs_store
 from resume2job.storage.jobs_store import compute_jd_hash
@@ -128,27 +126,18 @@ def lookup_ingested_jd_profile(jd_text: str) -> Optional[dict]:
 
 def upsert_job_record(job_id: str, jd_text: str, jd_profile: dict,
                       index_text: str, source: str = "batch_indexed") -> None:
-    """把一条 JD 的完整业务数据写入 SQLite 事实源（幂等覆盖）。"""
-    location = jd_profile.get("location") if isinstance(jd_profile.get("location"), dict) else {}
-    skills = list(dict.fromkeys([*(jd_profile.get("hard_skills") or []),
-                                 *(jd_profile.get("tools_or_frameworks") or [])]))
-    jobs_store.upsert_job({
-        "job_id": job_id,
-        "company": jd_profile.get("company") or "unknown_company",
-        "title": jd_profile.get("title") or "unknown_title",
-        "city": location.get("city") or "",
-        "direction": jd_profile.get("direction") or "",
-        "education_level": jd_profile.get("education_level") or "",
-        "jd_text": jd_text,
-        "jd_hash": compute_jd_hash(jd_text),
-        "jd_profile": jd_profile,
-        "index_text": index_text,
-        "requirements": jd_profile.get("responsibilities") or [],
-        "skills": skills,
-        "source": source,
-        # 硬约束预过滤列（cities_json/job_types_json/min_degree_rank/city_status/education_status）
-        **derive_constraint_fields(jd_profile),
-    })
+    """把一条 JD 的完整业务数据写入 SQLite 事实源（幂等覆盖，含版本 / 质量戳）。
+
+    经 ingest.models.JobRecord 装配，统一盖上 parser/index_text/embedding 版本戳与 quality_score，
+    再交 jobs_store.upsert_job。批量建库主流程已改走 ingest.lifecycle.ingest_record；本函数保留为
+    「仅写 SQLite 事实源、不碰向量」的便捷入口。
+    """
+    from resume2job.ingest.models import JobRecord
+    from resume2job.ingest.validator import validate_job
+    q = validate_job(jd_profile, jd_text)
+    record = JobRecord.from_jd_profile(job_id, jd_text, jd_profile, index_text=index_text,
+                                       source=source, quality_score=q.quality_score)
+    jobs_store.upsert_job(record.to_store_dict())
 
 
 # ===== 硬约束预过滤列回填（旧库 ALTER 补列后跑一次，从 jd_profile 重算，纯 SQLite）=====
@@ -182,124 +171,32 @@ def job_exists(collection, job_id: str) -> bool:
 # ===== 主流程 =====
 def index_jobs(jd_folder: str, db_path: str = DEFAULT_DB_PATH,
                collection_name: str = DEFAULT_COLLECTION_NAME) -> None:
-    """遍历 jd_folder 下 .txt 文件，逐条入库（SQLite 事实源 + Chroma 索引）。"""
-    # 1) 准备 Chroma 持久化客户端 + collection
+    """遍历 jd_folder 下的 JD 文件，经统一接入层（ingest.lifecycle）逐条入库。
+
+    历史上本函数自跑「读文件→parse→写 SQLite→写 Chroma」整条逻辑；现已收敛为
+    LocalFileConnector + lifecycle.ingest_record，与运行时粘贴入库共用**同一条接入路径**，
+    从根上消除两条路径写入漂移，并自动盖上版本戳 / 质量分。.txt/.md 以文件名 stem 作 job_id
+    （幂等更新），.json 可携带 company/title/source_job_id/canonical_url 等提示。
+    """
+    from resume2job.ingest.connectors import LocalFileConnector
+    from resume2job.ingest.lifecycle import ingest_all
+    from resume2job.ingest.models import SOURCE_BATCH
+
+    if not os.path.isdir(jd_folder):
+        print(f"[WARN] 文件夹不存在：{jd_folder}")
+        print("[DONE] 入库完成：created=0 updated=0 unchanged=0 duplicate=0 invalid=0 failed=0")
+        return
+
+    # Chroma collection：按 CLI 指定的 db_path / collection_name 打开（默认即统一向量库）
     client = chromadb.PersistentClient(path=db_path)
     collection = client.get_or_create_collection(name=collection_name)
 
-    # 2) 列出所有 .txt 文件（按文件名排序，保证可复现）
-    files = sorted(
-        f for f in os.listdir(jd_folder)
-        if f.lower().endswith(".txt") and os.path.isfile(os.path.join(jd_folder, f))
-    )
-
-    if not files:
-        print(f"[WARN] 文件夹中没有 .txt 文件：{jd_folder}")
-        print("[DONE] 入库完成：成功 0 条，跳过 0 条，失败 0 条。")
-        return
-
-    ok_count = 0
-    skip_count = 0
-    fail_count = 0
-
-    for fname in files:
-        fpath = os.path.join(jd_folder, fname)
-        job_id = os.path.splitext(fname)[0]
-        print(f"[START] 正在处理：{fname}")
-
-        # 3) 读取原文
-        try:
-            with open(fpath, "r", encoding="utf-8") as f:
-                jd_text = f.read()
-        except Exception as e:
-            print(f"[ERROR] 文件读取失败：{fname}，原因：{e}")
-            fail_count += 1
-            continue
-
-        if not jd_text or not jd_text.strip():
-            print(f"[SKIP] 文件为空：{fname}")
-            skip_count += 1
-            continue
-
-        # 4) 取画像：SQLite 已有**且 JD 原文未变（哈希一致）**则复用（零 token）；
-        #    原文变了则重解析——否则 SQLite 复用旧画像、Chroma 留旧向量，造成双通道不一致。
-        cur_hash = compute_jd_hash(jd_text)
-        existing = jobs_store.get_job(job_id)
-        content_changed = bool(existing) and existing.get("jd_hash") != cur_hash
-        if existing and existing.get("jd_profile") and not content_changed:
-            jd_profile = existing["jd_profile"]
-            print(f"[INFO] 画像已在 SQLite 且原文未变，复用：{job_id}")
-        else:
-            if content_changed:
-                print(f"[INFO] JD 原文已变（哈希不一致），重新解析并刷新向量：{job_id}")
-            try:
-                jd_profile = parse_jd(jd_text)
-            except Exception as e:
-                print(f"[ERROR] 解析失败：{fname}，原因：{e}")
-                fail_count += 1
-                continue
-            # 解析失败可区分（空文本 / 模型异常 / 输出非 JSON）：打印具体原因，不静默
-            if not isinstance(jd_profile, dict) or not jd_profile or jd_profile.get("error"):
-                reason = jd_profile.get("error") if isinstance(jd_profile, dict) and jd_profile.get("error") \
-                    else "结果为空"
-                print(f"[ERROR] 解析失败：{fname}（{reason}）")
-                fail_count += 1
-                continue
-
-        # 5) 构造 index_text 并刷新 SQLite 事实源（幂等覆盖）
-        index_text = build_index_text(jd_profile)
-        if not index_text.strip():
-            print(f"[ERROR] index_text 为空：{fname}")
-            fail_count += 1
-            continue
-        try:
-            upsert_job_record(job_id, jd_text, jd_profile, index_text)
-        except Exception as e:
-            print(f"[ERROR] 写入 SQLite 失败：{fname}，原因：{e}")
-            fail_count += 1
-            continue
-
-        # 6) 向量库写入：原文未变且已存在则跳过（省 token）；原文已变则删旧向量后重嵌入，保持两通道一致
-        in_chroma = job_exists(collection, job_id)
-        if in_chroma and not content_changed:
-            print(f"[SKIP] job_id 已存在且原文未变（向量库）：{job_id}")
-            skip_count += 1
-            continue
-        if in_chroma and content_changed:
-            try:
-                collection.delete(ids=[job_id])
-                print(f"[INFO] 删除旧向量，准备重嵌入：{job_id}")
-            except Exception as e:
-                print(f"[WARN] 删除旧向量失败（将直接覆盖写入）：{e}")
-
-        # 7) 获取向量并写入 Chroma（最小可过滤 metadata）
-        try:
-            vector = get_embedding(index_text)
-        except Exception as e:
-            print(f"[ERROR] Embedding 失败：{fname}，原因：{e}")
-            fail_count += 1
-            continue
-
-        metadata = build_chroma_metadata(job_id, jd_profile)
-        try:
-            collection.add(
-                ids=[job_id],
-                embeddings=[vector],
-                documents=[index_text],
-                metadatas=[metadata],
-            )
-        except Exception as e:
-            print(f"[ERROR] 写入 ChromaDB 失败：{fname}，原因：{e}")
-            fail_count += 1
-            continue
-
-        company = metadata.get("company") or "未知公司"
-        title = metadata.get("title") or "未知岗位"
-        print(f"[OK] 入库成功（SQLite + 向量库）：{job_id} - {company} - {title}")
-        ok_count += 1
-
-    # 8) 汇总
-    print(f"[DONE] 入库完成：成功 {ok_count} 条，跳过 {skip_count} 条，失败 {fail_count} 条。")
+    connector = LocalFileConnector(jd_folder, source=SOURCE_BATCH)
+    summary = ingest_all(connector, collection=collection, verbose=True)
+    c = summary["counts"]
+    print(f"[DONE] 入库完成：created={c['created']} updated={c['updated']} "
+          f"unchanged={c['unchanged']} duplicate={c['duplicate']} "
+          f"invalid={c['invalid']} failed={c['failed']}")
 
 
 # ===== CLI =====

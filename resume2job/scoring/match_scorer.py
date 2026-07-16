@@ -815,6 +815,19 @@ def validate_llm_score_result(data: Optional[dict], default_score: int = 50) -> 
     return {"score": score, "evidence": evidence}
 
 
+def _record_score_llm(model, usage, latency_ms) -> None:
+    """把 project 评分的**内联** OpenAI 调用 token+时延记入当前 request trace（Stage 2 可观测）。
+
+    project 评分为传 extra_body(enable_thinking=False) 自建了 OpenAI client（未走 core.llm.call_llm），
+    故需在此单独挂钩，否则评分这一最贵环节的 token 成本不可见。无活跃 trace 时 no-op、异常吞掉。
+    """
+    try:
+        from resume2job.observability import events
+        events.record_llm_call("chat", model, usage, latency_ms)
+    except Exception:
+        pass
+
+
 def call_llm_score(resume_profile: dict, jd_profile: dict) -> dict:
     """LLM 项目匹配度评分（project_score，5 档 rubric）。方向不再走 LLM（改 compute_direction_bonus）。失败返回保守分数。"""
     # 1) 构造裁剪后的输入
@@ -832,8 +845,10 @@ def call_llm_score(resume_profile: dict, jd_profile: dict) -> dict:
         return {"score": default_score, "evidence": ["未配置 API Key，使用保守分数。"]}
 
     try:
+        import time as _time
         from openai import OpenAI
         client = OpenAI(api_key=api_key, base_url=BASE_URL)
+        _t0 = _time.perf_counter()
         completion = client.chat.completions.create(
             model=SCORE_MODEL_NAME,
             messages=[
@@ -845,6 +860,8 @@ def call_llm_score(resume_profile: dict, jd_profile: dict) -> dict:
             # 仅 Qwen3/flash 等混合推理模型识别该参数，旧模型会忽略。
             extra_body={"enable_thinking": False},
         )
+        _record_score_llm(SCORE_MODEL_NAME, getattr(completion, "usage", None),
+                          (_time.perf_counter() - _t0) * 1000.0)
         raw = (completion.choices[0].message.content or "").strip()
     except Exception as e:
         print(f"[ERROR] LLM 调用失败（project_score）：{e}")
@@ -948,8 +965,10 @@ def call_llm_score_batch(resume_profile: dict, jd_profiles: list) -> list:
 
     user_prompt = _build_user_prompt_for_score_batch(resume_subset, jd_subsets)
     try:
+        import time as _time
         from openai import OpenAI
         client = OpenAI(api_key=api_key, base_url=BASE_URL)
+        _t0 = _time.perf_counter()
         completion = client.chat.completions.create(
             model=SCORE_MODEL_NAME,
             messages=[
@@ -959,6 +978,8 @@ def call_llm_score_batch(resume_profile: dict, jd_profiles: list) -> list:
             temperature=0.0,
             extra_body={"enable_thinking": False},
         )
+        _record_score_llm(SCORE_MODEL_NAME, getattr(completion, "usage", None),
+                          (_time.perf_counter() - _t0) * 1000.0)
         raw = (completion.choices[0].message.content or "").strip()
     except Exception as e:
         print(f"[ERROR] LLM 调用失败（project_score 批量）：{e}")

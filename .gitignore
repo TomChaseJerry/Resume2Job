@@ -1,0 +1,8 @@
+# IDE / Python runtime files
+.idea/
+__pycache__/
+*.py[cod]
+
+# Personal resumes must never be committed.
+Resumes/*.pdf
+

@@ -33,6 +33,7 @@ from resume2job.ingest.connectors import (
     CSVConnector,
     UserPasteConnector,
     OfficialCareerConnector,
+    ByteDanceCampusConnector,
 )
 
 __all__ = [
@@ -44,4 +45,5 @@ __all__ = [
     "validate_job", "normalize_raw_payload", "clean_text", "versions",
     # 接入器
     "Connector", "LocalFileConnector", "CSVConnector", "UserPasteConnector", "OfficialCareerConnector",
+    "ByteDanceCampusConnector",
 ]
